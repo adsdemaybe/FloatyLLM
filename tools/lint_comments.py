@@ -9,12 +9,34 @@ import os
 EXTS = {".cu", ".cuh", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh", ".hxx"}
 
 
+def normalize_line_splices(text):
+    # C/C++ line splicing removes backslash-newline before tokenization.
+    out = []
+    pos = []
+    i, n = 0, len(text)
+    line, col = 1, 1
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n and text[i + 1] == "\n":
+            i += 2
+            line, col = line + 1, 1
+            continue
+        out.append(c)
+        pos.append((line, col))
+        if c == "\n":
+            line, col = line + 1, 1
+        else:
+            col += 1
+        i += 1
+    return "".join(out), pos
+
+
 def find_block_comments(text):
     # Scan char-by-char, skipping string/char literals and `//` line comments.
     # Return list of (line, col) where a `/*` block comment opens.
+    text, pos = normalize_line_splices(text)
     hits = []
     i, n = 0, len(text)
-    line, col = 1, 1
     in_str = False        # inside "..."
     in_char = False       # inside '...'
     while i < n:
@@ -22,13 +44,13 @@ def find_block_comments(text):
         nxt = text[i + 1] if i + 1 < n else ""
         if in_str:
             if c == "\\":
-                i, col = i + 2, col + 2
+                i += 2
                 continue
             if c == '"':
                 in_str = False
         elif in_char:
             if c == "\\":
-                i, col = i + 2, col + 2
+                i += 2
                 continue
             if c == "'":
                 in_char = False
@@ -36,21 +58,15 @@ def find_block_comments(text):
             # line comment: skip to end of line
             while i < n and text[i] != "\n":
                 i += 1
-            line, col = line + 1, 1
-            i += 1
             continue
         elif c == "/" and nxt == "*":
-            hits.append((line, col))
-            i, col = i + 2, col + 2
+            hits.append(pos[i])
+            i += 2
             continue
         elif c == '"':
             in_str = True
         elif c == "'":
             in_char = True
-        if c == "\n":
-            line, col = line + 1, 1
-        else:
-            col += 1
         i += 1
     return hits
 
