@@ -37,3 +37,11 @@ add_test(NAME rope COMMAND test_rope)
 add_executable(test_elementwise tests/test_elementwise.cu)
 target_link_libraries(test_elementwise PRIVATE semillm_core)
 add_test(NAME elementwise COMMAND test_elementwise)
+
+add_executable(test_softmax tests/test_softmax.cu)
+target_link_libraries(test_softmax PRIVATE semillm_core)
+add_test(NAME softmax COMMAND test_softmax)
+
+add_executable(test_attention tests/test_attention.cu)
+target_link_libraries(test_attention PRIVATE semillm_core)
+add_test(NAME attention COMMAND test_attention)
