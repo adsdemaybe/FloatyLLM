@@ -29,3 +29,11 @@ add_test(NAME dequant COMMAND test_dequant)
 add_executable(test_rmsnorm tests/test_rmsnorm.cu)
 target_link_libraries(test_rmsnorm PRIVATE semillm_core)
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
+
+add_executable(test_rope tests/test_rope.cu)
+target_link_libraries(test_rope PRIVATE semillm_core)
+add_test(NAME rope COMMAND test_rope)
+
+add_executable(test_elementwise tests/test_elementwise.cu)
+target_link_libraries(test_elementwise PRIVATE semillm_core)
+add_test(NAME elementwise COMMAND test_elementwise)

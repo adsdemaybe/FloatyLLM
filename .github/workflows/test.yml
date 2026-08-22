@@ -11,7 +11,7 @@ jobs:
       - name: Build + run CPU reference tests (no GPU)
         run: |
           set -e
-          for ref in tools/dequant_ref.cpp tools/rmsnorm_ref.cpp; do
+          for ref in tools/*_ref.cpp; do
             bin="/tmp/$(basename "$ref" .cpp)"
             echo "=== $ref ==="
             c++ -std=c++17 -O2 -Wall -o "$bin" "$ref"
