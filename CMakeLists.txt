@@ -25,3 +25,7 @@ enable_testing()
 add_executable(test_dequant tests/test_dequant.cu)
 target_link_libraries(test_dequant PRIVATE semillm_core)
 add_test(NAME dequant COMMAND test_dequant)
+
+add_executable(test_rmsnorm tests/test_rmsnorm.cu)
+target_link_libraries(test_rmsnorm PRIVATE semillm_core)
+add_test(NAME rmsnorm COMMAND test_rmsnorm)
