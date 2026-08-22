@@ -1,0 +1,35 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.a
+*.out
+*.exe
+*.ptx
+*.cubin
+*.fatbin
+
+# Models / weights (large binaries)
+*.gguf
+*.safetensors
+*.bin
+weights/
+models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Profiling
+*.nsys-rep
+*.ncu-rep
+*.qdrep
