@@ -45,3 +45,7 @@ add_test(NAME softmax COMMAND test_softmax)
 add_executable(test_attention tests/test_attention.cu)
 target_link_libraries(test_attention PRIVATE semillm_core)
 add_test(NAME attention COMMAND test_attention)
+
+add_executable(test_gemm tests/test_gemm.cu)
+target_link_libraries(test_gemm PRIVATE semillm_core)
+add_test(NAME gemm COMMAND test_gemm)
