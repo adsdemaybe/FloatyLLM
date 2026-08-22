@@ -49,3 +49,7 @@ add_test(NAME attention COMMAND test_attention)
 add_executable(test_gemm tests/test_gemm.cu)
 target_link_libraries(test_gemm PRIVATE semillm_core)
 add_test(NAME gemm COMMAND test_gemm)
+
+add_executable(test_layer tests/test_layer.cu)
+target_link_libraries(test_layer PRIVATE semillm_core)
+add_test(NAME layer COMMAND test_layer)
