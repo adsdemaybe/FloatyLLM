@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.20)
 project(SemiLLM LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -11,6 +11,17 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-file(GLOB SEMILLM_SRC CONFIGURE_DEPENDS src/*.cu src/*.cpp)
-add_executable(semillm ${SEMILLM_SRC})
-target_link_libraries(semillm PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+# Core library: everything in src/ except the entry point.
+file(GLOB CORE_SRC CONFIGURE_DEPENDS src/*.cu src/*.cpp)
+list(REMOVE_ITEM CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cu)
+add_library(semillm_core STATIC ${CORE_SRC})
+target_include_directories(semillm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(semillm_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt)
+
+add_executable(semillm src/main.cu)
+target_link_libraries(semillm PRIVATE semillm_core)
+
+enable_testing()
+add_executable(test_dequant tests/test_dequant.cu)
+target_link_libraries(test_dequant PRIVATE semillm_core)
+add_test(NAME dequant COMMAND test_dequant)

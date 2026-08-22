@@ -14,6 +14,6 @@ if ! command -v dot >/dev/null 2>&1; then
     echo "error: graphviz 'dot' not found (brew install graphviz)" >&2
     exit 1
 fi
-mkdir -p src
+mkdir -p src build/codegraph
 doxygen Doxyfile
 echo "codegraph: build/codegraph/html/index.html"

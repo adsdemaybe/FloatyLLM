@@ -12,4 +12,4 @@ jobs:
         with:
           python-version: "3.x"
       - name: Forbid multiline comments
-        run: python3 tools/lint_comments.py src tools
+        run: python3 tools/lint_comments.py src tools tests
