@@ -17,3 +17,4 @@ jobs:
         with:
           name: codegraph
           path: build/codegraph/html
+          if-no-files-found: error
