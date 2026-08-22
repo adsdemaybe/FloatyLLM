@@ -1,4 +1,4 @@
-# Build
+# Build / generated docs (codegraph output lands in build/codegraph)
 build/
 cmake-build-*/
 *.o

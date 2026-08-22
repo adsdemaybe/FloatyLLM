@@ -1,0 +1,19 @@
+name: codegraph
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  graph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install doxygen + graphviz
+        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz
+      - name: Generate call/dependency graphs
+        run: sh tools/codegraph.sh
+      - name: Upload graph HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph
+          path: build/codegraph/html
