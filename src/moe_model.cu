@@ -124,8 +124,10 @@ bool load_moe_model(const GgufFile& g, LoadedMoeModel* out, int q_bits, std::str
         const TensorInfo *an = T("attn_norm.weight"), *fn = T("ffn_norm.weight");
         const TensorInfo *wq = T("attn_q.weight"), *wk = T("attn_k.weight"), *wv = T("attn_v.weight"), *wo = T("attn_output.weight");
         const TensorInfo *ri = T("ffn_gate_inp.weight");
+        // Experts may be one merged 3D tensor (ffn_gate_exps) or per-expert 2D tensors
+        // (ffn_gate.{e}.weight). Support both.
         const TensorInfo *ge = T("ffn_gate_exps.weight"), *ue = T("ffn_up_exps.weight"), *de = T("ffn_down_exps.weight");
-        if (!an||!fn||!wq||!wk||!wv||!wo||!ri||!ge||!ue||!de) { failed = L; return; }
+        if (!an||!fn||!wq||!wk||!wv||!wo||!ri) { failed = L; return; }
 
         if (!dequant_tensor(g, *an, tmp)) { failed = L; return; }
         memcpy(base.data()+out->blob.off_attn_norm, tmp.data(), tmp.size()*sizeof(__half));
@@ -140,12 +142,24 @@ bool load_moe_model(const GgufFile& g, LoadedMoeModel* out, int q_bits, std::str
         // router [E, dim] -> transpose [dim, E]
         if (!load_mat(g, ri, 0, E, dim, base.data(), out->blob.off_router, tmp, tt)) { failed=L; return; }
 
-        // experts: each e slice. gate/up: [ef, dim] per expert -> [dim, ef]. down: [dim, ef] -> [ef, dim].
+        // experts: per-expert 2D tensors if present, else a slice of the 3D tensor.
         for (int e = 0; e < E; ++e) {
             size_t ebase = out->blob.off_experts + (size_t)e*out->blob.expert_stride;
-            if (!load_mat(g, ge, (size_t)e*dim*ef, ef, dim, base.data(), ebase+out->blob.off_egate, tmp, tt)) { failed=L; return; }
-            if (!load_mat(g, ue, (size_t)e*dim*ef, ef, dim, base.data(), ebase+out->blob.off_eup, tmp, tt)) { failed=L; return; }
-            if (!load_mat(g, de, (size_t)e*ef*dim, dim, ef, base.data(), ebase+out->blob.off_edown, tmp, tt)) { failed=L; return; }
+            char pn[96]; int o, in;
+            snprintf(pn, sizeof(pn), "blk.%d.ffn_gate.%d.weight", L, e); const TensorInfo* gpe = gguf_find_tensor(g, pn);
+            snprintf(pn, sizeof(pn), "blk.%d.ffn_up.%d.weight", L, e);   const TensorInfo* upe = gguf_find_tensor(g, pn);
+            snprintf(pn, sizeof(pn), "blk.%d.ffn_down.%d.weight", L, e); const TensorInfo* dpe = gguf_find_tensor(g, pn);
+            bool ok;
+            if (gpe && upe && dpe) {
+                weight_out_in(*gpe, &o, &in); ok = load_mat(g, gpe, 0, o, in, base.data(), ebase+out->blob.off_egate, tmp, tt);
+                weight_out_in(*upe, &o, &in); ok = ok && load_mat(g, upe, 0, o, in, base.data(), ebase+out->blob.off_eup, tmp, tt);
+                weight_out_in(*dpe, &o, &in); ok = ok && load_mat(g, dpe, 0, o, in, base.data(), ebase+out->blob.off_edown, tmp, tt);
+            } else if (ge && ue && de) {
+                ok = load_mat(g, ge, (size_t)e*dim*ef, ef, dim, base.data(), ebase+out->blob.off_egate, tmp, tt) &&
+                     load_mat(g, ue, (size_t)e*dim*ef, ef, dim, base.data(), ebase+out->blob.off_eup, tmp, tt) &&
+                     load_mat(g, de, (size_t)e*ef*dim, dim, ef, base.data(), ebase+out->blob.off_edown, tmp, tt);
+            } else { ok = false; }
+            if (!ok) { failed = L; return; }
         }
 
         uint8_t* dst = out->h_layer_q + (size_t)L*out->q_layer_bytes;
