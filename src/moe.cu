@@ -1,5 +1,9 @@
 // MoE MLP implementation.
 #include "moe.h"
+#include "rmsnorm.h"
+#include "rope.h"
+#include "attention.h"
+#include "elementwise.h"
 
 // One thread per token: softmax over experts, keep top-k, renormalize.
 __global__ void router_topk_kernel(const __half* logits, float* route_w,
@@ -75,4 +79,46 @@ void moe_mlp(Gemm* g, const __half* x, const __half* const* wgate,
         gemm_rowmajor(g, gate, wdown[e], ye, T, dim, ffn, stream);
         scale_accumulate_kernel<<<(td + t - 1) / t, t, 0, stream>>>(out, ye, route_w, e, n_experts, T, dim);
     }
+}
+
+void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
+                              const MoeLayerWeights& w, __half* hidden, const int* d_positions,
+                              int n_new, int layer_idx, int len_before, KVCache& kv,
+                              LayerScratch& s, MoeScratch& ms, Gemm* gemm, cudaStream_t stream) {
+    int dim = cfg.dim, qd = cfg.n_heads * cfg.head_dim, kvd = cfg.n_kv_heads * cfg.head_dim;
+    float scale = 1.0f / sqrtf((float)cfg.head_dim);
+
+    // --- attention block (same as layer_forward_cached) ---
+    __half* Kbase = kv.K + (size_t)layer_idx * kv.max_T * kvd;
+    __half* Vbase = kv.V + (size_t)layer_idx * kv.max_T * kvd;
+    __half* Kdst = Kbase + (size_t)len_before * kvd;
+    __half* Vdst = Vbase + (size_t)len_before * kvd;
+    rmsnorm(hidden, w.attn_norm, s.xn, n_new, dim, cfg.eps, stream);
+    gemm_rowmajor(gemm, s.xn, w.wq, s.q, n_new, qd, dim, stream);
+    gemm_rowmajor(gemm, s.xn, w.wk, Kdst, n_new, kvd, dim, stream);
+    gemm_rowmajor(gemm, s.xn, w.wv, Vdst, n_new, kvd, dim, stream);
+    rope_inplace(s.q, d_positions, n_new, cfg.n_heads, cfg.head_dim, cfg.rope_base, stream);
+    rope_inplace(Kdst, d_positions, n_new, cfg.n_kv_heads, cfg.head_dim, cfg.rope_base, stream);
+    attention_cached(s.q, Kbase, Vbase, s.att, n_new, len_before,
+                     cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, stream);
+    gemm_rowmajor(gemm, s.att, w.wo, s.proj, n_new, dim, qd, stream);
+    residual_add(hidden, s.proj, n_new * dim, stream);
+
+    // --- MoE MLP block ---
+    rmsnorm(hidden, w.ffn_norm, s.xn, n_new, dim, cfg.eps, stream);
+    moe_router(gemm, s.xn, w.w_gate, ms.logits, ms.route_w, n_new, dim,
+               mcfg.n_experts, mcfg.n_used, stream);
+    moe_mlp(gemm, s.xn, w.wgate, w.wup, w.wdown, ms.route_w, ms.moe_out,
+            ms.gate, ms.up, ms.ye, n_new, dim, mcfg.expert_ffn, mcfg.n_experts, stream);
+
+    // Optional shared expert: always-on SwiGLU added to the routed sum.
+    if (mcfg.has_shared && w.sh_gate) {
+        gemm_rowmajor(gemm, s.xn, w.sh_gate, ms.gate, n_new, mcfg.expert_ffn, dim, stream);
+        gemm_rowmajor(gemm, s.xn, w.sh_up, ms.up, n_new, mcfg.expert_ffn, dim, stream);
+        silu(ms.gate, ms.gate, n_new * mcfg.expert_ffn, stream);
+        elementwise_mul(ms.gate, ms.up, ms.gate, n_new * mcfg.expert_ffn, stream);
+        gemm_rowmajor(gemm, ms.gate, w.sh_down, ms.ye, n_new, dim, mcfg.expert_ffn, stream);
+        residual_add(ms.moe_out, ms.ye, n_new * dim, stream);
+    }
+    residual_add(hidden, ms.moe_out, n_new * dim, stream);
 }

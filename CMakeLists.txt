@@ -66,3 +66,7 @@ add_test(NAME runner COMMAND test_runner)
 add_executable(test_moe tests/test_moe.cu)
 target_link_libraries(test_moe PRIVATE semillm_core)
 add_test(NAME moe COMMAND test_moe)
+
+add_executable(test_moe_layer tests/test_moe_layer.cu)
+target_link_libraries(test_moe_layer PRIVATE semillm_core)
+add_test(NAME moe_layer COMMAND test_moe_layer)
