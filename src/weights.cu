@@ -6,6 +6,9 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <algorithm>
 
 namespace {
 
@@ -114,36 +117,40 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
     out->q8_layer_bytes = (per / 32) * 34;
     cudaHostAlloc((void**)&out->h_layer_q8, out->q8_layer_bytes * out->n_layers, cudaHostAllocDefault);
 
-    std::vector<__half> layer_buf(per), tmp, tt;
-    const char* proj[7] = {"attn_q.weight", "attn_k.weight", "attn_v.weight",
-                           "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
+    // Each layer is independent -> load them in parallel across CPU cores.
+    // dequant [out,in] -> transpose -> [in,out] -> re-quantize to Q8_0. Per-thread
+    // temp buffers; threads write disjoint layers of the pinned Q8_0 array.
+    std::atomic<int> failed{-1};
+    auto load_layer = [&](int L) {
+        std::vector<__half> base(per), tmp, tt;
+        LayerTensors lt; std::string e;
+        if (!get_layer_tensors(g, L, &lt, &e)) { failed = L; return; }
+        if (!dequant_tensor(g, *lt.attn_norm, tmp)) { failed = L; return; }
+        memcpy(base.data() + out->blob.off_attn_norm, tmp.data(), tmp.size() * sizeof(__half));
+        if (!dequant_tensor(g, *lt.ffn_norm, tmp)) { failed = L; return; }
+        memcpy(base.data() + out->blob.off_ffn_norm, tmp.data(), tmp.size() * sizeof(__half));
 
-    for (int L = 0; L < out->n_layers; ++L) {
-        LayerTensors lt;
-        if (!get_layer_tensors(g, L, &lt, err)) return false;
-        __half* base = layer_buf.data();   // fp16 temp for this layer
-
-        // norms (1D, no transpose)
-        if (!dequant_tensor(g, *lt.attn_norm, tmp)) { if (err) *err = "attn_norm quant"; return false; }
-        memcpy(base + out->blob.off_attn_norm, tmp.data(), tmp.size() * sizeof(__half));
-        if (!dequant_tensor(g, *lt.ffn_norm, tmp)) { if (err) *err = "ffn_norm quant"; return false; }
-        memcpy(base + out->blob.off_ffn_norm, tmp.data(), tmp.size() * sizeof(__half));
-
-        // projections: dequant [out,in] then transpose -> [in,out] at blob offset
         const TensorInfo* pt[7] = {lt.wq, lt.wk, lt.wv, lt.wo, lt.wgate, lt.wup, lt.wdown};
         size_t poff[7] = {out->blob.off_wq, out->blob.off_wk, out->blob.off_wv, out->blob.off_wo,
                           out->blob.off_wgate, out->blob.off_wup, out->blob.off_wdown};
         for (int i = 0; i < 7; ++i) {
-            if (!dequant_tensor(g, *pt[i], tmp)) { if (err) *err = std::string("quant ") + proj[i]; return false; }
+            if (!dequant_tensor(g, *pt[i], tmp)) { failed = L; return; }
             int o, in; weight_out_in(*pt[i], &o, &in);
             tt.resize((size_t)o * in);
             transpose_host(tmp.data(), tt.data(), o, in);   // [out,in] -> [in,out]
-            memcpy(base + poff[i], tt.data(), tt.size() * sizeof(__half));
+            memcpy(base.data() + poff[i], tt.data(), tt.size() * sizeof(__half));
         }
-        // Re-quantize the fp16 layer to Q8_0 for streaming (half the RAM + transfer).
-        quantize_q8_0(base, per, out->h_layer_q8 + (size_t)L * out->q8_layer_bytes);
-        if (L == 0 || (L + 1) % 8 == 0) printf("  loaded layer %d/%d\n", L + 1, out->n_layers);
-    }
+        quantize_q8_0(base.data(), per, out->h_layer_q8 + (size_t)L * out->q8_layer_bytes);
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    int nthreads = (int)std::min<unsigned>(hw ? hw : 4u, (unsigned)out->n_layers);
+    printf("loading %d layers on %d threads...\n", out->n_layers, nthreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < nthreads; ++t)
+        threads.emplace_back([&, t]() { for (int L = t; L < out->n_layers; L += nthreads) load_layer(L); });
+    for (auto& th : threads) th.join();
+    if (failed.load() >= 0) { if (err) *err = "failed to load a layer (unsupported quant?)"; return false; }
 
     // Non-layer weights on device (no transpose: token_embd row=id, output row=vocab).
     out->rw.token_embd = upload_tensor(g, *embd, err);
