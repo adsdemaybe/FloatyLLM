@@ -5,6 +5,13 @@
 
 static constexpr int SOFTMAX_TPB = 256;
 
+// Portable max functor. cub::Max was removed in CUDA 13; this works on 12.x and 13.
+struct MaxOp {
+    __device__ __forceinline__ float operator()(float a, float b) const {
+        return a > b ? a : b;
+    }
+};
+
 __global__ void softmax_kernel(const __half* x, __half* out, int dim) {
     int row = blockIdx.x;
     const __half* xr = x + (size_t)row * dim;
@@ -19,7 +26,7 @@ __global__ void softmax_kernel(const __half* x, __half* out, int dim) {
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         m = fmaxf(m, __half2float(xr[i]));
     }
-    float bm = BlockReduce(temp).Reduce(m, cub::Max());
+    float bm = BlockReduce(temp).Reduce(m, MaxOp());
     if (threadIdx.x == 0) shared_max = bm;
     __syncthreads();
     float mx = shared_max;
