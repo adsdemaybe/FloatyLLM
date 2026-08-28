@@ -4,6 +4,7 @@
 #include "kquant.h"
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <vector>
 
 namespace {
@@ -39,6 +40,27 @@ bool dequant_host(const uint8_t* data, uint32_t type, size_t n, __half* dst) {
         return true;
     }
     return false;  // other quants not yet supported
+}
+
+// Quantize an fp16 array to Q8_0 (34 bytes / 32 values): d = amax/127, q = round(x/d).
+void quantize_q8_0(const __half* x, size_t n, uint8_t* out) {
+    const size_t nb = n / 32;
+    for (size_t b = 0; b < nb; ++b) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(__half2float(x[b * 32 + j])));
+        const float d = amax / 127.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        __half dh = __float2half(d);
+        memcpy(out, &dh, 2);
+        int8_t* qs = reinterpret_cast<int8_t*>(out + 2);
+        for (int j = 0; j < 32; ++j) {
+            int q = (int)lroundf(__half2float(x[b * 32 + j]) * id);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            qs[j] = (int8_t)q;
+        }
+        out += 34;
+    }
 }
 
 // Transpose src[rows, cols] (row-major) -> dst[cols, rows] (row-major), fp16.
@@ -89,16 +111,17 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
 
     out->blob = layer_blob_layout(cfg);
     const size_t per = out->blob.total_elems;
-    cudaHostAlloc((void**)&out->h_layer_weights, per * out->n_layers * sizeof(__half), cudaHostAllocDefault);
+    out->q8_layer_bytes = (per / 32) * 34;
+    cudaHostAlloc((void**)&out->h_layer_q8, out->q8_layer_bytes * out->n_layers, cudaHostAllocDefault);
 
-    std::vector<__half> tmp, tt;
+    std::vector<__half> layer_buf(per), tmp, tt;
     const char* proj[7] = {"attn_q.weight", "attn_k.weight", "attn_v.weight",
                            "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
 
     for (int L = 0; L < out->n_layers; ++L) {
         LayerTensors lt;
         if (!get_layer_tensors(g, L, &lt, err)) return false;
-        __half* base = out->h_layer_weights + (size_t)L * per;
+        __half* base = layer_buf.data();   // fp16 temp for this layer
 
         // norms (1D, no transpose)
         if (!dequant_tensor(g, *lt.attn_norm, tmp)) { if (err) *err = "attn_norm quant"; return false; }
@@ -117,6 +140,8 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
             transpose_host(tmp.data(), tt.data(), o, in);   // [out,in] -> [in,out]
             memcpy(base + poff[i], tt.data(), tt.size() * sizeof(__half));
         }
+        // Re-quantize the fp16 layer to Q8_0 for streaming (half the RAM + transfer).
+        quantize_q8_0(base, per, out->h_layer_q8 + (size_t)L * out->q8_layer_bytes);
         if (L == 0 || (L + 1) % 8 == 0) printf("  loaded layer %d/%d\n", L + 1, out->n_layers);
     }
 
@@ -137,9 +162,9 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
 }
 
 void free_model(LoadedModel* m) {
-    if (m->h_layer_weights) cudaFreeHost(m->h_layer_weights);
+    if (m->h_layer_q8) cudaFreeHost(m->h_layer_q8);
     if (m->rw.token_embd) cudaFree((void*)m->rw.token_embd);
     if (m->rw.final_norm) cudaFree((void*)m->rw.final_norm);
     if (m->rw.output && m->rw.output != m->rw.token_embd) cudaFree((void*)m->rw.output);
-    m->h_layer_weights = nullptr;
+    m->h_layer_q8 = nullptr;
 }

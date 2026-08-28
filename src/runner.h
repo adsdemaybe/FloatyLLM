@@ -16,6 +16,7 @@ struct RunnerBufs {
     __half* normed;   // [T, dim]
     int*    positions;// [T]  (0..T-1)
     __half* logits;   // [vocab]  (for the last token)
+    __half* arena;    // [blob.total_elems]  (fp16 dequant scratch, quantized path)
 };
 
 // Embed token ids (device) into hidden [T, dim].
@@ -29,3 +30,11 @@ void forward_logits(const LlamaConfig& cfg, const LayerBlob& blob,
                     const RunnerWeights& rw, const int* d_ids, int T, int vocab,
                     RunnerBufs& bufs, LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream);
+
+// Quantized-streaming forward: streams Q8_0 layer blobs, dequant on GPU (bufs.arena).
+void forward_logits_q8(const LlamaConfig& cfg, const LayerBlob& blob,
+                       const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                       int batch_layers, const RunnerWeights& rw, const int* d_ids,
+                       int T, int vocab, RunnerBufs& bufs, LayerScratch& scratch,
+                       SlotPool& pool, Gemm* gemm,
+                       cudaStream_t copy_stream, cudaStream_t compute_stream);

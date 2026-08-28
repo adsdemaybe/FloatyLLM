@@ -30,9 +30,9 @@ int main(int argc, char** argv) {
     LoadedModel m;
     if (!load_model(g, &m, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
     const LlamaConfig& cfg = m.cfg;
-    printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB fp16\n",
+    printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB Q8 streamed (vs %.1f GB fp16)\n",
            m.arch.c_str(), m.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim,
-           m.vocab, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
+           m.vocab, m.q8_layer_bytes / 1e9 * m.n_layers, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
 
     int qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ffn = cfg.ffn_dim;
     RunnerBufs bufs;
@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&bufs.normed, (size_t)max_T*cfg.dim*sizeof(__half));
     cudaMalloc(&bufs.positions, max_T*sizeof(int));
     cudaMalloc(&bufs.logits, (size_t)m.vocab*sizeof(__half));
+    cudaMalloc(&bufs.arena, (size_t)m.blob.total_elems*sizeof(__half));   // fp16 dequant scratch
     LayerScratch s;
     cudaMalloc(&s.xn, (size_t)max_T*cfg.dim*sizeof(__half)); cudaMalloc(&s.q, (size_t)max_T*qd*sizeof(__half));
     cudaMalloc(&s.k, (size_t)max_T*kvd*sizeof(__half)); cudaMalloc(&s.v, (size_t)max_T*kvd*sizeof(__half));
@@ -51,10 +52,11 @@ int main(int argc, char** argv) {
     if (slots_env) { int v = atoi(slots_env); if (v >= 2) n_slots = v; }
     const char* batch_env = getenv("SEMILLM_BATCH");
     if (batch_env) { int v = atoi(batch_env); if (v >= 1) batch_layers = v; }
-    SlotPool pool; slotpool_create(&pool, n_slots, (size_t)batch_layers * m.blob.total_elems);
-    printf("streamed working set = %d slots x %d layers/batch x %.1f MB = %.2f GB VRAM\n",
-           n_slots, batch_layers, m.blob.total_elems*2/1e6,
-           (double)n_slots*batch_layers*m.blob.total_elems*2/1e9);
+    size_t slot_elems = ((size_t)batch_layers * m.q8_layer_bytes + 1) / 2;   // __half units covering Q8 bytes
+    SlotPool pool; slotpool_create(&pool, n_slots, slot_elems);
+    printf("streamed working set = %d slots x %d layers/batch x %.1f MB (Q8) = %.2f GB VRAM\n",
+           n_slots, batch_layers, m.q8_layer_bytes/1e6,
+           (double)n_slots*batch_layers*m.q8_layer_bytes/1e9);
     report_mem("after alloc");
 
     int* d_ids; cudaMalloc(&d_ids, max_T*sizeof(int));
@@ -69,8 +71,8 @@ int main(int argc, char** argv) {
     for (int step = 0; step < n_gen; ++step) {
         int T = (int)ids.size();
         cudaMemcpy(d_ids, ids.data(), T*sizeof(int), cudaMemcpyHostToDevice);
-        forward_logits(cfg, m.blob, m.h_layer_weights, m.n_layers, batch_layers, m.rw, d_ids, T, m.vocab,
-                       bufs, s, pool, &gemm, cs, ms);
+        forward_logits_q8(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.n_layers, batch_layers,
+                          m.rw, d_ids, T, m.vocab, bufs, s, pool, &gemm, cs, ms);
         cudaMemcpy(logits.data(), bufs.logits, m.vocab*sizeof(__half), cudaMemcpyDeviceToHost);
         for (int v = 0; v < m.vocab; ++v) lf[v] = __half2float(logits[v]);
         int next = sample_greedy(lf.data(), m.vocab);

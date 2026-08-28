@@ -40,3 +40,14 @@ void stream_forward(const LlamaConfig& cfg, const LayerBlob& blob,
                     __half* hidden, const int* d_positions, int n_tokens,
                     LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream);
+
+// Quantized streaming: h_q8 holds per-layer Q8_0 blobs (q8_layer_bytes each). A
+// batch of Q8_0 layers is copied in ONE DMA (half the bytes of fp16), then each
+// layer is dequantized on the GPU into `arena` (fp16, blob.total_elems) before
+// layer_forward. pool slots hold batch_layers * q8_layer_bytes bytes.
+void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
+                       const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                       int batch_layers, __half* arena, __half* hidden,
+                       const int* d_positions, int n_tokens, LayerScratch& scratch,
+                       SlotPool& pool, Gemm* gemm,
+                       cudaStream_t copy_stream, cudaStream_t compute_stream);

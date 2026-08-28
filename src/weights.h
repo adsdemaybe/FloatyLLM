@@ -12,8 +12,11 @@ struct LoadedModel {
     int n_layers = 0;     // from ModelConfig.block_count
     int vocab = 0;
     std::string arch;
-    LayerBlob blob;
-    __half* h_layer_weights = nullptr;   // pinned, n_layers * blob.total_elems (fp16)
+    LayerBlob blob;                       // fp16 element offsets (arena layout)
+    // Weights are re-quantized to Q8_0 for streaming (half the RAM + transfer of
+    // fp16). Each layer = (blob.total_elems/32) Q8_0 blocks of 34 bytes.
+    uint8_t* h_layer_q8 = nullptr;        // pinned, n_layers * q8_layer_bytes
+    size_t q8_layer_bytes = 0;
     RunnerWeights rw{};                   // device token_embd / final_norm / output
 };
 
