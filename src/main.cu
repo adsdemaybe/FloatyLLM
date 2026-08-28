@@ -47,6 +47,8 @@ int main(int argc, char** argv) {
     cudaMalloc(&s.gate, (size_t)max_T*ffn*sizeof(__half)); cudaMalloc(&s.up, (size_t)max_T*ffn*sizeof(__half));
 
     int n_slots = 4;
+    const char* slots_env = getenv("SEMILLM_SLOTS");
+    if (slots_env) { int v = atoi(slots_env); if (v >= 2) n_slots = v; }
     SlotPool pool; slotpool_create(&pool, n_slots, m.blob.total_elems);
     printf("streamed weight working set = %d slots x %.1f MB = %.2f GB VRAM\n",
            n_slots, m.blob.total_elems*2/1e6, (double)n_slots*m.blob.total_elems*2/1e9);
