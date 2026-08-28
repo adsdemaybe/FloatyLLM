@@ -67,7 +67,12 @@ __half* upload_tensor(const GgufFile& g, const TensorInfo& t, std::string* err) 
 }  // namespace
 
 bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
-    if (!read_config(g, &out->cfg, err)) return false;
+    ModelConfig mc;
+    if (!read_config(g, &mc, err)) return false;
+    out->arch = mc.arch;
+    out->n_layers = mc.n_layers;
+    out->cfg = LlamaConfig{mc.dim, mc.n_heads, mc.n_kv_heads, mc.head_dim, mc.ffn_dim,
+                           mc.eps, mc.rope_base};
     const LlamaConfig& cfg = out->cfg;
 
     const TensorInfo* embd = gguf_find_tensor(g, "token_embd.weight");
@@ -76,13 +81,13 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
 
     out->blob = layer_blob_layout(cfg);
     const size_t per = out->blob.total_elems;
-    cudaHostAlloc((void**)&out->h_layer_weights, per * cfg.n_layers * sizeof(__half), cudaHostAllocDefault);
+    cudaHostAlloc((void**)&out->h_layer_weights, per * out->n_layers * sizeof(__half), cudaHostAllocDefault);
 
     std::vector<__half> tmp, tt;
     const char* proj[7] = {"attn_q.weight", "attn_k.weight", "attn_v.weight",
                            "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
 
-    for (int L = 0; L < cfg.n_layers; ++L) {
+    for (int L = 0; L < out->n_layers; ++L) {
         LayerTensors lt;
         if (!get_layer_tensors(g, L, &lt, err)) return false;
         __half* base = out->h_layer_weights + (size_t)L * per;
@@ -104,7 +109,7 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
             transpose_host(tmp.data(), tt.data(), o, in);   // [out,in] -> [in,out]
             memcpy(base + poff[i], tt.data(), tt.size() * sizeof(__half));
         }
-        if (L == 0 || (L + 1) % 8 == 0) printf("  loaded layer %d/%d\n", L + 1, cfg.n_layers);
+        if (L == 0 || (L + 1) % 8 == 0) printf("  loaded layer %d/%d\n", L + 1, out->n_layers);
     }
 
     // Non-layer weights on device (no transpose: token_embd row=id, output row=vocab).

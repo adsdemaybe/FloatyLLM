@@ -8,8 +8,10 @@
 #include <string>
 
 struct LoadedModel {
-    LlamaConfig cfg;
+    LlamaConfig cfg;      // per-layer compute config (for forward_logits)
+    int n_layers = 0;     // from ModelConfig.block_count
     int vocab = 0;
+    std::string arch;
     LayerBlob blob;
     __half* h_layer_weights = nullptr;   // pinned, n_layers * blob.total_elems (fp16)
     RunnerWeights rw{};                   // device token_embd / final_norm / output

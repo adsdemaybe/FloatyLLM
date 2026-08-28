@@ -34,10 +34,10 @@ int main(int argc, char** argv) {
     if (!load_model(g, &m, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
     const LlamaConfig& cfg = m.cfg;
     printf("model: arch=%s layers=%d dim=%d heads=%d/%d head_dim=%d ffn=%d vocab=%d\n",
-           cfg.arch.c_str(), cfg.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads,
+           m.arch.c_str(), m.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads,
            cfg.head_dim, cfg.ffn_dim, m.vocab);
     printf("per-layer blob = %.1f MB, whole model (fp16) = %.1f GB\n",
-           m.blob.total_elems * 2 / 1e6, m.blob.total_elems * 2.0 * cfg.n_layers / 1e9);
+           m.blob.total_elems * 2 / 1e6, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
 
     // Device buffers.
     int qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ffn = cfg.ffn_dim;
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     cudaStream_t cs, ms; cudaStreamCreate(&cs); cudaStreamCreate(&ms);
     Gemm gemm; gemm_create(&gemm);
 
-    forward_logits(cfg, m.blob, m.h_layer_weights, cfg.n_layers, m.rw, d_ids, T, m.vocab,
+    forward_logits(cfg, m.blob, m.h_layer_weights, m.n_layers, m.rw, d_ids, T, m.vocab,
                    bufs, s, pool, &gemm, cs, ms);
 
     cudaError_t e = cudaGetLastError();
