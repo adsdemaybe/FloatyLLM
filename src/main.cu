@@ -32,23 +32,22 @@ int main(int argc, char** argv) {
     const char* qb = getenv("SEMILLM_QBITS");
     if (qb && atoi(qb) == 8) q_bits = 8;
 
-    // MoE models take a separate path (router + experts).
+    // MoE models: separate path (router + experts), streaming original quant from mmap.
     if (is_moe_model(g)) {
         LoadedMoeModel mm;
-        if (!load_moe_model(g, &mm, q_bits, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
-        printf("MoE: arch=%s layers=%d dim=%d experts=%d/%d expert_ffn=%d vocab=%d | %.1f GB Q%d\n",
+        if (!load_moe_model(g, &mm, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
+        printf("MoE: arch=%s layers=%d dim=%d experts=%d/%d expert_ffn=%d vocab=%d | %.1f GB fp16, streamed from disk\n",
                mm.arch.c_str(), mm.n_layers, mm.cfg.dim, mm.mcfg.n_used, mm.mcfg.n_experts,
-               mm.mcfg.expert_ffn, mm.vocab, mm.q_layer_bytes/1e9*mm.n_layers, mm.q_bits);
-        gguf_close(&g);   // weights extracted; release the mmap
-        report_mem("after load");
-        int nsl = 2, bl = 1;
-        const char* se = getenv("SEMILLM_SLOTS"); if (se && atoi(se) >= 2) nsl = atoi(se);
-        const char* be = getenv("SEMILLM_BATCH"); if (be && atoi(be) >= 1) bl = atoi(be);
-        if (!moe_generate(mm, ids, n_gen, nsl, bl, &err)) { printf("moe_generate: %s\n", err.c_str()); return 1; }
+               mm.mcfg.expert_ffn, mm.vocab, mm.blob.total_elems * 2.0 / 1e9 * mm.n_layers);
+        report_mem("after load");   // mmap kept alive for streaming
+        double budget = 8.0;
+        const char* bg = getenv("SEMILLM_BUDGET"); if (bg && atof(bg) > 0) budget = atof(bg);
+        if (!moe_generate(mm, ids, n_gen, budget, &err)) { printf("moe_generate: %s\n", err.c_str()); return 1; }
         printf("generated ids:");
         for (int i = prompt_len; i < (int)ids.size(); ++i) printf(" %d", ids[i]);
         printf("\nfull sequence:"); for (int id : ids) printf(" %d", id); printf("\n");
         report_mem("after gen");
+        gguf_close(&g);
         return 0;
     }
 

@@ -90,3 +90,36 @@ void dequant_q6_K(const BlockQ6K* d_blocks, __half* d_out, int n_blocks, cudaStr
     int t = 128;
     dequant_q6_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
 }
+
+__global__ void transpose_kernel(const __half* src, __half* dst, int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    int r = i / cols, c = i % cols;
+    dst[(size_t)c * rows + r] = src[i];
+}
+
+void transpose_fp16(const __half* src, __half* dst, int rows, int cols, cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0) return;
+    int n = rows * cols, t = 256;
+    transpose_kernel<<<(n + t - 1) / t, t, 0, stream>>>(src, dst, rows, cols);
+}
+
+__global__ void f32_to_f16_kernel(const float* src, __half* dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+void dequant_to_fp16(const uint8_t* q, __half* out, uint32_t type, size_t n, cudaStream_t stream) {
+    int t = 256;
+    switch (type) {
+        case 0:  // F32
+            f32_to_f16_kernel<<<(n + t - 1) / t, t, 0, stream>>>((const float*)q, out, n); break;
+        case 1:  // F16
+            cudaMemcpyAsync(out, q, n * sizeof(__half), cudaMemcpyDeviceToDevice, stream); break;
+        case 2:  dequant_q4_0((const BlockQ40*)q, out, (int)(n / 32), stream); break;   // Q4_0
+        case 8:  dequant_q8_0((const BlockQ80*)q, out, (int)(n / 32), stream); break;   // Q8_0
+        case 12: dequant_q4_K((const BlockQ4K*)q, out, (int)(n / 256), stream); break;  // Q4_K
+        case 14: dequant_q6_K((const BlockQ6K*)q, out, (int)(n / 256), stream); break;  // Q6_K
+        default: break;
+    }
+}

@@ -36,3 +36,11 @@ static_assert(sizeof(BlockQ6K) == 210, "BlockQ6K must be 210 bytes");
 
 void dequant_q4_K(const BlockQ4K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream);
 void dequant_q6_K(const BlockQ6K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream);
+
+// Transpose fp16 src[rows,cols] (row-major) -> dst[cols,rows] on the GPU.
+void transpose_fp16(const __half* src, __half* dst, int rows, int cols, cudaStream_t stream);
+
+// Dequant n elements of a tensor region (device quant/float bytes) -> fp16, by ggml
+// type (F32/F16/Q4_0/Q8_0/Q4_K/Q6_K). Lets original quantized weights be streamed
+// and dequantized on the GPU.
+void dequant_to_fp16(const uint8_t* q, __half* out, uint32_t ggml_type, size_t n, cudaStream_t stream);
