@@ -57,3 +57,7 @@ add_test(NAME layer COMMAND test_layer)
 add_executable(test_stream tests/test_stream.cu)
 target_link_libraries(test_stream PRIVATE semillm_core)
 add_test(NAME stream COMMAND test_stream)
+
+add_executable(test_runner tests/test_runner.cu)
+target_link_libraries(test_runner PRIVATE semillm_core)
+add_test(NAME runner COMMAND test_runner)
