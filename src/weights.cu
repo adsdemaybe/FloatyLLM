@@ -1,6 +1,7 @@
 // Real-model weight loading: host dequant + transpose into fp16, pack into the
 // streaming blob layout, upload non-layer weights to device.
 #include "weights.h"
+#include "kquant.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -30,7 +31,14 @@ bool dequant_host(const uint8_t* data, uint32_t type, size_t n, __half* dst) {
         }
         return true;
     }
-    return false;  // K-quants not yet supported
+    if (type == GGML_Q4_K || type == GGML_Q6_K) {
+        std::vector<float> f(n);
+        if (type == GGML_Q4_K) dequant_q4_K_f32(data, n, f.data());
+        else dequant_q6_K_f32(data, n, f.data());
+        for (size_t i = 0; i < n; ++i) dst[i] = __float2half(f[i]);
+        return true;
+    }
+    return false;  // other quants not yet supported
 }
 
 // Transpose src[rows, cols] (row-major) -> dst[cols, rows] (row-major), fp16.
