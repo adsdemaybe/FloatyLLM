@@ -1,0 +1,19 @@
+name: test
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  cpu-reference-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + run CPU reference tests (no GPU)
+        run: |
+          set -e
+          for ref in tools/*_ref.cpp; do
+            bin="/tmp/$(basename "$ref" .cpp)"
+            echo "=== $ref ==="
+            c++ -std=c++17 -O2 -Wall -o "$bin" "$ref"
+            "$bin"
+          done
