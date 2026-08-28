@@ -38,8 +38,9 @@ int main() {
 
     Gemm g; gemm_create(&g);
     moe_router(&g, x, Wgate, logits, route_w, T, dim, E, topk, 0);
+    std::vector<int> active(E); for (int e = 0; e < E; ++e) active[e] = e;
     moe_mlp(&g, x, wgate.data(), wup.data(), wdown.data(), route_w, out, gate, up, ye,
-            T, dim, ffn, E, 0);
+            T, dim, ffn, E, active.data(), E, 0);
 
     // Reference: single dense SwiGLU with the shared weights.
     __half *rg, *ru, *rh, *ry;

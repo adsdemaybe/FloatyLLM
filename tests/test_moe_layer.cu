@@ -50,6 +50,7 @@ int main() {
     cudaMalloc(&ms.logits,n_new*mcfg.n_experts*2); cudaMalloc(&ms.route_w,n_new*mcfg.n_experts*sizeof(float));
     cudaMalloc(&ms.gate,n_new*ef*2); cudaMalloc(&ms.up,n_new*ef*2);
     cudaMalloc(&ms.ye,n_new*dim*2); cudaMalloc(&ms.moe_out,n_new*dim*2);
+    cudaHostAlloc((void**)&ms.h_route, n_new*mcfg.n_experts*sizeof(float), cudaHostAllocDefault);
 
     KVCache kv; kv.n_layers=1; kv.max_T=n_new; kv.kvd=kvd; kv.len=0;
     cudaMalloc(&kv.K,(size_t)n_new*kvd*2); cudaMalloc(&kv.V,(size_t)n_new*kvd*2);

@@ -203,6 +203,7 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen,
     cudaMalloc(&ms.logits,(size_t)max_T*E*2); cudaMalloc(&ms.route_w,(size_t)max_T*E*sizeof(float));
     cudaMalloc(&ms.gate,(size_t)max_T*ef*2); cudaMalloc(&ms.up,(size_t)max_T*ef*2);
     cudaMalloc(&ms.ye,(size_t)max_T*dim*2); cudaMalloc(&ms.moe_out,(size_t)max_T*dim*2);
+    cudaHostAlloc((void**)&ms.h_route, (size_t)max_T*E*sizeof(float), cudaHostAllocDefault);
     KVCache kv; kv.n_layers=m.n_layers; kv.max_T=max_T; kv.kvd=kvd; kv.len=0;
     cudaMalloc(&kv.K,(size_t)m.n_layers*max_T*kvd*2); cudaMalloc(&kv.V,(size_t)m.n_layers*max_T*kvd*2);
 

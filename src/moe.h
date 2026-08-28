@@ -14,12 +14,14 @@ void moe_router(Gemm* g, const __half* x, const __half* w_gate, __half* logits_T
                 cudaStream_t stream);
 
 // MoE MLP: out[T,dim] = sum_e route_w[:,e] * down_e(silu(gate_e(x)) * up_e(x)).
-// wgate/wup/wdown: arrays of n_experts device pointers, each [in,out] row-major.
-// gate/up/ye: scratch [T*ffn], [T*ffn], [T*dim].
+// Computes ONLY the active experts (active[0..n_active), the ones any token routed
+// to) - so decode with top-k does k expert FFNs, not n_experts. wgate/wup/wdown:
+// arrays of n_experts device pointers, each [in,out]. gate/up/ye: scratch.
 void moe_mlp(Gemm* g, const __half* x, const __half* const* wgate,
              const __half* const* wup, const __half* const* wdown,
              const float* route_w, __half* out, __half* gate, __half* up, __half* ye,
-             int T, int dim, int ffn, int n_experts, cudaStream_t stream);
+             int T, int dim, int ffn, int n_experts, const int* active, int n_active,
+             cudaStream_t stream);
 
 // --- Full MoE decoder layer (attention + MoE MLP) ---
 struct MoeConfig {
@@ -43,6 +45,7 @@ struct MoeScratch {
     __half* up;       // [n_new * expert_ffn]
     __half* ye;       // [n_new * dim]
     __half* moe_out;  // [n_new * dim]
+    float*  h_route;  // pinned host [n_new * n_experts] (to pick active experts)
 };
 
 // Cached MoE decoder layer: attention (KV cache) + router + experts (+ shared).
