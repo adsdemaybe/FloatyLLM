@@ -31,3 +31,62 @@ void dequant_q4_0(const BlockQ40* d_blocks, __half* d_out, int n_blocks, cudaStr
     if (n_blocks <= 0) return;
     dequant_q4_0_kernel<<<n_blocks, 16, 0, stream>>>(d_blocks, d_out, n_blocks);
 }
+
+// --- K-quants (one thread per 256-value super-block; blocks are independent) ---
+__device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else { *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+
+__global__ void dequant_q4_K_kernel(const BlockQ4K* blocks, __half* y, int nb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    const BlockQ4K& b = blocks[i];
+    float d = __half2float(b.d), mn = __half2float(b.dmin);
+    const uint8_t* q = b.qs;
+    __half* yy = y + (size_t)i * 256;
+    int is = 0, yi = 0; uint8_t sc, m;
+    for (int j = 0; j < 256; j += 64) {
+        get_scale_min_k4(is + 0, b.scales, &sc, &m); float d1 = d * sc, m1 = mn * m;
+        get_scale_min_k4(is + 1, b.scales, &sc, &m); float d2 = d * sc, m2 = mn * m;
+        for (int l = 0; l < 32; ++l) yy[yi++] = __float2half(d1 * (float)(q[l] & 0xF) - m1);
+        for (int l = 0; l < 32; ++l) yy[yi++] = __float2half(d2 * (float)(q[l] >> 4) - m2);
+        q += 32; is += 2;
+    }
+}
+
+__global__ void dequant_q6_K_kernel(const BlockQ6K* blocks, __half* y, int nb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    const BlockQ6K& b = blocks[i];
+    float d = __half2float(b.d);
+    __half* yy = y + (size_t)i * 256;
+    for (int nn = 0; nn < 256; nn += 128) {
+        const uint8_t* Ql = b.ql + (nn / 128) * 64;
+        const uint8_t* Qh = b.qh + (nn / 128) * 32;
+        const int8_t* Sc = b.scales + (nn / 128) * 8;
+        for (int l = 0; l < 32; ++l) {
+            int is = l / 16;
+            int8_t q1 = (int8_t)((Ql[l + 0] & 0xF) | (((Qh[l] >> 0) & 3) << 4)) - 32;
+            int8_t q2 = (int8_t)((Ql[l + 32] & 0xF) | (((Qh[l] >> 2) & 3) << 4)) - 32;
+            int8_t q3 = (int8_t)((Ql[l + 0] >> 4) | (((Qh[l] >> 4) & 3) << 4)) - 32;
+            int8_t q4 = (int8_t)((Ql[l + 32] >> 4) | (((Qh[l] >> 6) & 3) << 4)) - 32;
+            yy[nn + l + 0]  = __float2half(d * Sc[is + 0] * q1);
+            yy[nn + l + 32] = __float2half(d * Sc[is + 2] * q2);
+            yy[nn + l + 64] = __float2half(d * Sc[is + 4] * q3);
+            yy[nn + l + 96] = __float2half(d * Sc[is + 6] * q4);
+        }
+    }
+}
+
+void dequant_q4_K(const BlockQ4K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    int t = 128;
+    dequant_q4_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
+}
+
+void dequant_q6_K(const BlockQ6K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    int t = 128;
+    dequant_q6_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
+}

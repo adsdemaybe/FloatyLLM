@@ -26,3 +26,13 @@ struct __align__(2) BlockQ40 {
 static_assert(sizeof(BlockQ40) == 18, "BlockQ40 must be 18 bytes");
 
 void dequant_q4_0(const BlockQ40* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream);
+
+// K-quant super-blocks (256 values). GPU dequant, so original Q4_K/Q6_K weights can
+// be streamed and dequantized on the device (no host requant).
+struct __align__(2) BlockQ4K { __half d, dmin; uint8_t scales[12]; uint8_t qs[128]; };  // 144 B
+struct __align__(2) BlockQ6K { uint8_t ql[128], qh[64]; int8_t scales[16]; __half d; };  // 210 B
+static_assert(sizeof(BlockQ4K) == 144, "BlockQ4K must be 144 bytes");
+static_assert(sizeof(BlockQ6K) == 210, "BlockQ6K must be 210 bytes");
+
+void dequant_q4_K(const BlockQ4K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream);
+void dequant_q6_K(const BlockQ6K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream);

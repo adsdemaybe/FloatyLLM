@@ -70,3 +70,7 @@ add_test(NAME moe COMMAND test_moe)
 add_executable(test_moe_layer tests/test_moe_layer.cu)
 target_link_libraries(test_moe_layer PRIVATE semillm_core)
 add_test(NAME moe_layer COMMAND test_moe_layer)
+
+add_executable(test_kquant_gpu tests/test_kquant_gpu.cu)
+target_link_libraries(test_kquant_gpu PRIVATE semillm_core)
+add_test(NAME kquant_gpu COMMAND test_kquant_gpu)
