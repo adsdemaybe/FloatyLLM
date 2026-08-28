@@ -23,7 +23,7 @@ void embed_tokens(const __half* token_embd, const int* d_ids, __half* d_hidden,
 }
 
 void forward_logits(const LlamaConfig& cfg, const LayerBlob& blob,
-                    const __half* h_layer_weights, int n_layers,
+                    const __half* h_layer_weights, int n_layers, int batch_layers,
                     const RunnerWeights& rw, const int* d_ids, int T, int vocab,
                     RunnerBufs& bufs, LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream) {
@@ -34,8 +34,8 @@ void forward_logits(const LlamaConfig& cfg, const LayerBlob& blob,
     embed_tokens(rw.token_embd, d_ids, bufs.hidden, T, cfg.dim, compute_stream);
 
     // streamed decoder layers (stream_forward syncs compute_stream at the end)
-    stream_forward(cfg, blob, h_layer_weights, n_layers, bufs.hidden, bufs.positions,
-                   T, scratch, pool, gemm, copy_stream, compute_stream);
+    stream_forward(cfg, blob, h_layer_weights, n_layers, batch_layers, bufs.hidden,
+                   bufs.positions, T, scratch, pool, gemm, copy_stream, compute_stream);
 
     // final RMSNorm
     rmsnorm(bufs.hidden, rw.final_norm, bufs.normed, T, cfg.dim, cfg.eps, compute_stream);

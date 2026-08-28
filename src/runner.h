@@ -25,7 +25,7 @@ void embed_tokens(const __half* token_embd, const int* d_ids, __half* d_hidden,
 // Full forward over n_layers streamed layers -> logits for the last token.
 // d_ids: device token ids [T]. h_layer_weights: pinned, layer-major packed blobs.
 void forward_logits(const LlamaConfig& cfg, const LayerBlob& blob,
-                    const __half* h_layer_weights, int n_layers,
+                    const __half* h_layer_weights, int n_layers, int batch_layers,
                     const RunnerWeights& rw, const int* d_ids, int T, int vocab,
                     RunnerBufs& bufs, LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream);

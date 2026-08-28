@@ -46,12 +46,15 @@ int main(int argc, char** argv) {
     cudaMalloc(&s.att, (size_t)max_T*qd*sizeof(__half)); cudaMalloc(&s.proj, (size_t)max_T*cfg.dim*sizeof(__half));
     cudaMalloc(&s.gate, (size_t)max_T*ffn*sizeof(__half)); cudaMalloc(&s.up, (size_t)max_T*ffn*sizeof(__half));
 
-    int n_slots = 4;
+    int n_slots = 4, batch_layers = 1;
     const char* slots_env = getenv("SEMILLM_SLOTS");
     if (slots_env) { int v = atoi(slots_env); if (v >= 2) n_slots = v; }
-    SlotPool pool; slotpool_create(&pool, n_slots, m.blob.total_elems);
-    printf("streamed weight working set = %d slots x %.1f MB = %.2f GB VRAM\n",
-           n_slots, m.blob.total_elems*2/1e6, (double)n_slots*m.blob.total_elems*2/1e9);
+    const char* batch_env = getenv("SEMILLM_BATCH");
+    if (batch_env) { int v = atoi(batch_env); if (v >= 1) batch_layers = v; }
+    SlotPool pool; slotpool_create(&pool, n_slots, (size_t)batch_layers * m.blob.total_elems);
+    printf("streamed working set = %d slots x %d layers/batch x %.1f MB = %.2f GB VRAM\n",
+           n_slots, batch_layers, m.blob.total_elems*2/1e6,
+           (double)n_slots*batch_layers*m.blob.total_elems*2/1e9);
     report_mem("after alloc");
 
     int* d_ids; cudaMalloc(&d_ids, max_T*sizeof(int));
@@ -66,7 +69,7 @@ int main(int argc, char** argv) {
     for (int step = 0; step < n_gen; ++step) {
         int T = (int)ids.size();
         cudaMemcpy(d_ids, ids.data(), T*sizeof(int), cudaMemcpyHostToDevice);
-        forward_logits(cfg, m.blob, m.h_layer_weights, m.n_layers, m.rw, d_ids, T, m.vocab,
+        forward_logits(cfg, m.blob, m.h_layer_weights, m.n_layers, batch_layers, m.rw, d_ids, T, m.vocab,
                        bufs, s, pool, &gemm, cs, ms);
         cudaMemcpy(logits.data(), bufs.logits, m.vocab*sizeof(__half), cudaMemcpyDeviceToHost);
         for (int v = 0; v < m.vocab; ++v) lf[v] = __half2float(logits[v]);

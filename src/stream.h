@@ -31,9 +31,12 @@ LayerWeights weights_from_blob(const __half* base, const LayerBlob& b);
 
 // Stream n_layers of packed fp16 weights (h_weights: pinned, layer-major,
 // n_layers * blob.total_elems) through layer_forward, updating hidden in place.
-// Copy runs on copy_stream, compute on compute_stream; execute-on-completion.
+// batch_layers = layers copied per DMA: a batch is contiguous in h_weights, so
+// each prefetch is ONE big cudaMemcpyAsync of batch_layers layers -> maximizes
+// PCIe transfer size while the previous batch computes. pool slots must be sized
+// batch_layers * blob.total_elems. Copy on copy_stream, compute on compute_stream.
 void stream_forward(const LlamaConfig& cfg, const LayerBlob& blob,
-                    const __half* h_weights, int n_layers,
+                    const __half* h_weights, int n_layers, int batch_layers,
                     __half* hidden, const int* d_positions, int n_tokens,
                     LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream);
