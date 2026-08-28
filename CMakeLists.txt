@@ -53,3 +53,7 @@ add_test(NAME gemm COMMAND test_gemm)
 add_executable(test_layer tests/test_layer.cu)
 target_link_libraries(test_layer PRIVATE semillm_core)
 add_test(NAME layer COMMAND test_layer)
+
+add_executable(test_stream tests/test_stream.cu)
+target_link_libraries(test_stream PRIVATE semillm_core)
+add_test(NAME stream COMMAND test_stream)
