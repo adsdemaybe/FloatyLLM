@@ -1,6 +1,7 @@
 // Real-model weight loading: host dequant + transpose into fp16, pack into the
 // streaming blob layout, upload non-layer weights to device.
 #include "weights.h"
+#include "weights_util.h"
 #include "kquant.h"
 #include <cstdio>
 #include <cstring>
@@ -10,9 +11,7 @@
 #include <atomic>
 #include <algorithm>
 
-namespace {
-
-// Dequant n elements of a GGUF tensor into fp16 (host). F32/F16/Q8_0.
+// Dequant n elements of a GGUF tensor into fp16 (host). F32/F16/Q8_0/Q4_K/Q6_K.
 bool dequant_host(const uint8_t* data, uint32_t type, size_t n, __half* dst) {
     if (type == GGML_F32) {
         const float* f = reinterpret_cast<const float*>(data);
@@ -114,7 +113,7 @@ bool dequant_tensor(const GgufFile& g, const TensorInfo& t, std::vector<__half>&
 }
 
 // Upload a dequantized tensor to a fresh device buffer.
-__half* upload_tensor(const GgufFile& g, const TensorInfo& t, std::string* err) {
+static __half* upload_tensor(const GgufFile& g, const TensorInfo& t, std::string* err) {
     std::vector<__half> tmp;
     if (!dequant_tensor(g, t, tmp)) { if (err) *err = "unsupported quant for " + t.name; return nullptr; }
     __half* d;
@@ -122,8 +121,6 @@ __half* upload_tensor(const GgufFile& g, const TensorInfo& t, std::string* err) 
     cudaMemcpy(d, tmp.data(), tmp.size() * sizeof(__half), cudaMemcpyHostToDevice);
     return d;
 }
-
-}  // namespace
 
 bool load_model(const GgufFile& g, LoadedModel* out, int q_bits, std::string* err) {
     out->q_bits = (q_bits == 4) ? 4 : 8;

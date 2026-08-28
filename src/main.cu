@@ -2,6 +2,7 @@
 // streamed forward. usage: semillm <model.gguf> <n_generate> <tok0> [tok1 ...]
 // Prints the generated token ids (detokenize with llama.cpp) + tokens/s + VRAM.
 #include "weights.h"
+#include "moe_model.h"
 #include "runner.h"
 #include "sampling.h"
 #include <cstdio>
@@ -30,6 +31,26 @@ int main(int argc, char** argv) {
     int q_bits = 4;   // stream Q4_0 by default (4x smaller than fp16); SEMILLM_QBITS=8 for Q8_0
     const char* qb = getenv("SEMILLM_QBITS");
     if (qb && atoi(qb) == 8) q_bits = 8;
+
+    // MoE models take a separate path (router + experts).
+    if (is_moe_model(g)) {
+        LoadedMoeModel mm;
+        if (!load_moe_model(g, &mm, q_bits, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
+        printf("MoE: arch=%s layers=%d dim=%d experts=%d/%d expert_ffn=%d vocab=%d | %.1f GB Q%d\n",
+               mm.arch.c_str(), mm.n_layers, mm.cfg.dim, mm.mcfg.n_used, mm.mcfg.n_experts,
+               mm.mcfg.expert_ffn, mm.vocab, mm.q_layer_bytes/1e9*mm.n_layers, mm.q_bits);
+        report_mem("after load");
+        int nsl = 2, bl = 1;
+        const char* se = getenv("SEMILLM_SLOTS"); if (se && atoi(se) >= 2) nsl = atoi(se);
+        const char* be = getenv("SEMILLM_BATCH"); if (be && atoi(be) >= 1) bl = atoi(be);
+        if (!moe_generate(mm, ids, n_gen, nsl, bl, &err)) { printf("moe_generate: %s\n", err.c_str()); return 1; }
+        printf("generated ids:");
+        for (int i = prompt_len; i < (int)ids.size(); ++i) printf(" %d", ids[i]);
+        printf("\nfull sequence:"); for (int id : ids) printf(" %d", id); printf("\n");
+        report_mem("after gen");
+        return 0;
+    }
+
     LoadedModel m;
     if (!load_model(g, &m, q_bits, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
     const LlamaConfig& cfg = m.cfg;
