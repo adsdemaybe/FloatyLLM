@@ -52,7 +52,9 @@ bool read_moe_config(const GgufFile& g, LoadedMoeModel* out, std::string* err) {
     else out->cfg.n_kv_heads = out->cfg.n_heads;
     if (!need("expert_count", &out->mcfg.n_experts)) { if (err) *err = "no expert_count"; return false; }
     if (!need("expert_used_count", &out->mcfg.n_used)) { if (err) *err = "no expert_used_count"; return false; }
-    if (!need("expert_feed_forward_length", &out->mcfg.expert_ffn)) { if (err) *err = "no expert_ffn"; return false; }
+    // Mixtral has no expert_feed_forward_length; its experts use feed_forward_length.
+    if (!need("expert_feed_forward_length", &out->mcfg.expert_ffn) &&
+        !need("feed_forward_length", &out->mcfg.expert_ffn)) { if (err) *err = "no expert_ffn"; return false; }
     out->cfg.head_dim = out->cfg.dim / out->cfg.n_heads;
     out->cfg.ffn_dim = 0;
     out->cfg.eps = 1e-5f; out->cfg.rope_base = 10000.0f;
