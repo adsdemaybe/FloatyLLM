@@ -216,3 +216,68 @@ research claim is the **perplexity↔tokens/s frontier**, not the multiplier.
 - **Overlap:** Nsight copy(L+1)‖compute(L); wall ≈ max(load,compute)·L.
 - **Headline:** perplexity↔tokens/s frontier — mixed strictly dominates uniform at matched cap.
 - **Transfer:** PCIe bytes = ¼–½ of AirLLM's fp16 leg (instrumented).
+
+## 16. MoE extension (v2) — streaming trillion-param sparse models
+North star: run 200B–1T+ models. Those are Mixture-of-Experts, and streaming ❤ MoE.
+
+### Why streaming wins hardest on MoE
+Dense: stream all L layers every token. MoE: total params huge (1T) but only
+`expert_used_count` of `expert_count` experts fire per token per layer (Laguna: 8/256 ≈ 3%).
+**Stream only the activated experts** → per-token weight traffic is a tiny fraction of the model.
+A 1T MoE touches ~tens of B of weights/token; stream those, cache the hot ones → dense-quality
+on 121 GB. This is the target use case.
+
+### The core new challenge: dynamic expert selection
+Dense prefetch works because layer order is static (you know L+1 ahead). MoE expert choice is
+**data-dependent** — the router picks experts from the *current* activations, so you can't know
+which expert weights to load until the router runs. This breaks static prefetch for experts.
+Split each MoE layer:
+- **Dense/shared part** (attn, norms, router gate, shared expert) — data-independent → prefetch
+  exactly like v1.
+- **Routed experts** — dynamic → load on demand after routing.
+
+### Architecture additions
+1. **Router kernel** — `logits = x @ W_gate` [tokens, n_experts]; gating (softmax/sigmoid per
+   `expert_gating_func`, with `expert_weights_norm` / `expert_weights_scale`); top-k select →
+   (expert_id, weight) per token. Cheap (n_experts small).
+2. **Expert FFN (grouped)** — for the k selected experts: gather routed tokens → per-expert SwiGLU
+   (down·(silu(gate)·up)) → scatter-add scaled by the gate weight. Grouped/batched GEMM
+   (cuBLAS batched or CUTLASS grouped) or per-expert GEMM.
+3. **Shared expert** — always-on FFN (`expert_shared_feed_forward_length`), added to the routed sum.
+4. **Expert weight streaming + cache** (the new memory engine):
+   - **Hot-expert VRAM cache** (LRU / frequency): expert usage is skewed — keep the hottest resident,
+     stream only misses. Biggest lever at trillion scale.
+   - **On-demand load** — after routing, DMA the missing selected experts host→VRAM.
+   - **Intra-layer expert pipeline** — load expert e+1 while computing expert e (pipeline the k).
+5. **Config extension** — expert_count, expert_used_count, expert_feed_forward_length,
+   expert_shared_feed_forward_length, gating func, weights_scale/norm, leading_dense_block_count
+   (first N layers are dense → use the v1 path unchanged).
+
+### Overlap model for MoE (honest)
+- Attn / router / shared: overlap-prefetch like dense (data-independent).
+- Routed experts: intra-layer overlap is limited (router→experts dependency). Recover it via
+  (a) hot-expert cache (hits ⇒ no load), (b) intra-layer expert pipelining, (c) **batching** — a
+  batch activates the UNION of experts across its tokens, amortizing each expert load over many
+  tokens. Small batch ⇒ few experts, tiny load; large batch ⇒ most experts used but each serves
+  many tokens. Batch size is the MoE load/compute knob.
+
+### Trillion-param math (decode, per token)
+1T MoE, 256 experts/layer, 8 active. Per token/layer: 8 experts + shared + attn loaded ≈ a few %
+of total weights. With Q4 + hot-expert cache, streamable on 121 GB unified (GB10). That is the
+whole point of SemiLLM.
+
+### Also needed for Laguna-class (separate from the MoE core)
+Sliding-window + gated attention, QK-norm, YaRN rope scaling, per-layer variable head counts,
+**K-quant dequant (Q4_K / Q6_K)**. Additive to the attention + dequant modules; tracked apart from
+the routing core so the MoE work isn't blocked on them.
+
+### Interface impact (minimal churn to v1)
+- `moe_layer_forward` variant: attention identical to v1; MLP replaced by router + experts + shared.
+- `LlamaConfig` gains `is_moe` + expert fields; `leading_dense_block_count` layers keep the v1 path.
+- `stream_forward` gains an expert-streaming path + expert cache alongside the dense slot ring.
+- The v1 dense path stays intact and remains the fallback / foundation.
+
+### Staging
+- **v1 (now):** dense, Q8_0, streaming — validated on GB10 (9/9). Test small → large dense.
+- **v2:** MoE routing + expert streaming/cache (+ K-quant + Laguna attn features). Test a small MoE
+  GGUF (e.g. a Qwen-MoE) → Laguna-XS → Laguna-S.
