@@ -61,3 +61,7 @@ add_test(NAME stream COMMAND test_stream)
 add_executable(test_runner tests/test_runner.cu)
 target_link_libraries(test_runner PRIVATE semillm_core)
 add_test(NAME runner COMMAND test_runner)
+
+add_executable(test_moe tests/test_moe.cu)
+target_link_libraries(test_moe PRIVATE semillm_core)
+add_test(NAME moe COMMAND test_moe)
