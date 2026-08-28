@@ -46,7 +46,7 @@ void stream_forward(const LlamaConfig& cfg, const LayerBlob& blob,
 // layer is dequantized on the GPU into `arena` (fp16, blob.total_elems) before
 // layer_forward. pool slots hold batch_layers * q8_layer_bytes bytes.
 void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
-                       const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                       const uint8_t* h_q8, size_t q8_layer_bytes, int q_bits, int n_layers,
                        int batch_layers, __half* arena, __half* hidden,
                        const int* d_positions, int n_tokens, LayerScratch& scratch,
                        SlotPool& pool, Gemm* gemm,
@@ -55,7 +55,7 @@ void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
 // Quantized streaming with KV cache: processes n_new tokens through every streamed
 // layer, using layer_forward_cached (append K/V at len_before, attend the cache).
 void stream_forward_q8_cached(const LlamaConfig& cfg, const LayerBlob& blob,
-                              const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                              const uint8_t* h_q8, size_t q8_layer_bytes, int q_bits, int n_layers,
                               int batch_layers, __half* arena, __half* hidden,
                               const int* d_positions, int n_new, int len_before, KVCache& kv,
                               LayerScratch& scratch, SlotPool& pool, Gemm* gemm,

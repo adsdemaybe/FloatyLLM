@@ -27,12 +27,15 @@ int main(int argc, char** argv) {
     report_mem("start");
     GgufFile g; std::string err;
     if (!gguf_load(argv[1], &g, &err)) { printf("gguf_load: %s\n", err.c_str()); return 1; }
+    int q_bits = 4;   // stream Q4_0 by default (4x smaller than fp16); SEMILLM_QBITS=8 for Q8_0
+    const char* qb = getenv("SEMILLM_QBITS");
+    if (qb && atoi(qb) == 8) q_bits = 8;
     LoadedModel m;
-    if (!load_model(g, &m, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
+    if (!load_model(g, &m, q_bits, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
     const LlamaConfig& cfg = m.cfg;
-    printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB Q8 streamed (vs %.1f GB fp16)\n",
+    printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB Q%d streamed (vs %.1f GB fp16)\n",
            m.arch.c_str(), m.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim,
-           m.vocab, m.q8_layer_bytes / 1e9 * m.n_layers, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
+           m.vocab, m.q8_layer_bytes / 1e9 * m.n_layers, m.q_bits, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
 
     int qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ffn = cfg.ffn_dim;
     RunnerBufs bufs;
@@ -82,7 +85,7 @@ int main(int argc, char** argv) {
     printf("\nprefill %d prompt tokens + generate %d (KV cache)...\n", prompt_len, n_gen);
     // Prefill: whole prompt through the cache in one pass -> first token.
     cudaMemcpy(d_ids, ids.data(), prompt_len*sizeof(int), cudaMemcpyHostToDevice);
-    forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.n_layers, batch_layers,
+    forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.q_bits, m.n_layers, batch_layers,
                           m.rw, d_ids, prompt_len, 0, kv, m.vocab, bufs, s, pool, &gemm, cs, ms);
     kv.len = prompt_len;
     int next = sample_next();
@@ -92,7 +95,7 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     for (int step = 1; step < n_gen; ++step) {
         cudaMemcpy(d_ids, &next, sizeof(int), cudaMemcpyHostToDevice);
-        forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.n_layers, batch_layers,
+        forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.q_bits, m.n_layers, batch_layers,
                               m.rw, d_ids, 1, kv.len, kv, m.vocab, bufs, s, pool, &gemm, cs, ms);
         kv.len += 1;
         next = sample_next();

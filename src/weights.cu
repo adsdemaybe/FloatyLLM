@@ -66,6 +66,32 @@ void quantize_q8_0(const __half* x, size_t n, uint8_t* out) {
     }
 }
 
+// Quantize fp16 -> Q4_0 (18 bytes / 32 values): d = max/-8; nibble j = round(x/d)+8,
+// packed low=elem j, high=elem j+16. x = d*(q-8).
+void quantize_q4_0(const __half* x, size_t n, uint8_t* out) {
+    const size_t nb = n / 32;
+    for (size_t b = 0; b < nb; ++b) {
+        float amax = 0.0f, vmax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            float v = __half2float(x[b * 32 + j]);
+            if (fabsf(v) > amax) { amax = fabsf(v); vmax = v; }
+        }
+        const float d = vmax / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        __half dh = __float2half(d);
+        memcpy(out, &dh, 2);
+        uint8_t* qs = out + 2;
+        for (int j = 0; j < 16; ++j) {
+            int q0 = (int)(__half2float(x[b * 32 + j]) * id + 8.5f);
+            int q1 = (int)(__half2float(x[b * 32 + j + 16]) * id + 8.5f);
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            qs[j] = (uint8_t)(q0 | (q1 << 4));
+        }
+        out += 18;
+    }
+}
+
 // Transpose src[rows, cols] (row-major) -> dst[cols, rows] (row-major), fp16.
 void transpose_host(const __half* src, __half* dst, int rows, int cols) {
     for (int r = 0; r < rows; ++r)
@@ -99,7 +125,8 @@ __half* upload_tensor(const GgufFile& g, const TensorInfo& t, std::string* err) 
 
 }  // namespace
 
-bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
+bool load_model(const GgufFile& g, LoadedModel* out, int q_bits, std::string* err) {
+    out->q_bits = (q_bits == 4) ? 4 : 8;
     ModelConfig mc;
     if (!read_config(g, &mc, err)) return false;
     out->arch = mc.arch;
@@ -114,7 +141,7 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
 
     out->blob = layer_blob_layout(cfg);
     const size_t per = out->blob.total_elems;
-    out->q8_layer_bytes = (per / 32) * 34;
+    out->q8_layer_bytes = (per / 32) * (out->q_bits == 4 ? 18 : 34);
     cudaHostAlloc((void**)&out->h_layer_q8, out->q8_layer_bytes * out->n_layers, cudaHostAllocDefault);
 
     // Each layer is independent -> load them in parallel across CPU cores.
@@ -140,7 +167,9 @@ bool load_model(const GgufFile& g, LoadedModel* out, std::string* err) {
             transpose_host(tmp.data(), tt.data(), o, in);   // [out,in] -> [in,out]
             memcpy(base.data() + poff[i], tt.data(), tt.size() * sizeof(__half));
         }
-        quantize_q8_0(base.data(), per, out->h_layer_q8 + (size_t)L * out->q8_layer_bytes);
+        uint8_t* dst = out->h_layer_q8 + (size_t)L * out->q8_layer_bytes;
+        if (out->q_bits == 4) quantize_q4_0(base.data(), per, dst);
+        else quantize_q8_0(base.data(), per, dst);
     };
 
     unsigned hw = std::thread::hardware_concurrency();

@@ -17,10 +17,11 @@ struct LoadedModel {
     // fp16). Each layer = (blob.total_elems/32) Q8_0 blocks of 34 bytes.
     uint8_t* h_layer_q8 = nullptr;        // pinned, n_layers * q8_layer_bytes
     size_t q8_layer_bytes = 0;
+    int q_bits = 8;                       // streaming quant format: 8 (Q8_0) or 4 (Q4_0)
     RunnerWeights rw{};                   // device token_embd / final_norm / output
 };
 
-// Dequant + transpose all weights from a parsed GGUF into a LoadedModel.
-// Supports F32/F16/Q8_0 tensors (K-quants added later). Returns false + *err.
-bool load_model(const GgufFile& g, LoadedModel* out, std::string* err);
+// Dequant + transpose all weights from a parsed GGUF into a LoadedModel, then
+// re-quantize each layer to q_bits (8=Q8_0, 4=Q4_0) for streaming. Returns false + *err.
+bool load_model(const GgufFile& g, LoadedModel* out, int q_bits, std::string* err);
 void free_model(LoadedModel* m);
