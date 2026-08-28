@@ -100,6 +100,48 @@ void stream_forward(const LlamaConfig& cfg, const LayerBlob& blob,
     cudaStreamSynchronize(compute_stream);
 }
 
+void stream_forward_q8_cached(const LlamaConfig& cfg, const LayerBlob& blob,
+                              const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                              int batch_layers, __half* arena, __half* hidden,
+                              const int* d_positions, int n_new, int len_before, KVCache& kv,
+                              LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
+                              cudaStream_t copy_stream, cudaStream_t compute_stream) {
+    if (batch_layers < 1) batch_layers = 1;
+    int N = pool.n_slots;
+    int n_batches = (n_layers + batch_layers - 1) / batch_layers;
+    int blocks_per_layer = (int)(blob.total_elems / 32);
+
+    auto prefetch_batch = [&](int b) {
+        if (b >= n_batches) return;
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
+        cudaStreamWaitEvent(copy_stream, pool.compute_done[s], 0);
+        cudaMemcpyAsync((uint8_t*)pool.d_slots[s], h_q8 + (size_t)first * q8_layer_bytes,
+                        (size_t)cnt * q8_layer_bytes, cudaMemcpyHostToDevice, copy_stream);
+        cudaEventRecord(pool.copy_done[s], copy_stream);
+    };
+
+    prefetch_batch(0);
+    for (int b = 0; b < n_batches; ++b) {
+        prefetch_batch(b + 1);
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
+        cudaStreamWaitEvent(compute_stream, pool.copy_done[s], 0);
+        const uint8_t* slot = (const uint8_t*)pool.d_slots[s];
+        for (int l = 0; l < cnt; ++l) {
+            const BlockQ80* q8 = (const BlockQ80*)(slot + (size_t)l * q8_layer_bytes);
+            dequant_q8_0(q8, arena, blocks_per_layer, compute_stream);
+            LayerWeights w = weights_from_blob(arena, blob);
+            layer_forward_cached(cfg, w, hidden, d_positions, n_new, first + l, len_before,
+                                 kv, scratch, gemm, compute_stream);
+        }
+        cudaEventRecord(pool.compute_done[s], compute_stream);
+    }
+    cudaStreamSynchronize(compute_stream);
+}
+
 void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
                        const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
                        int batch_layers, __half* arena, __half* hidden,

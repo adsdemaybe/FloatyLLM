@@ -65,33 +65,54 @@ int main(int argc, char** argv) {
     std::vector<__half> logits(m.vocab);
     std::vector<float> lf(m.vocab);
 
-    // Greedy generation: re-run the growing prefix each step (no KV cache yet).
-    printf("\ngenerating %d tokens (greedy)...\n", n_gen);
-    auto t0 = std::chrono::steady_clock::now();
-    for (int step = 0; step < n_gen; ++step) {
-        int T = (int)ids.size();
-        cudaMemcpy(d_ids, ids.data(), T*sizeof(int), cudaMemcpyHostToDevice);
-        forward_logits_q8(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.n_layers, batch_layers,
-                          m.rw, d_ids, T, m.vocab, bufs, s, pool, &gemm, cs, ms);
+    // KV cache: persistent K/V per layer, so decode processes 1 new token per step
+    // (not the whole growing prefix).
+    KVCache kv;
+    kv.n_layers = m.n_layers; kv.max_T = max_T; kv.kvd = cfg.n_kv_heads * cfg.head_dim; kv.len = 0;
+    size_t kv_elems = (size_t)m.n_layers * max_T * kv.kvd;
+    cudaMalloc(&kv.K, kv_elems * sizeof(__half));
+    cudaMalloc(&kv.V, kv_elems * sizeof(__half));
+
+    auto sample_next = [&]() -> int {
         cudaMemcpy(logits.data(), bufs.logits, m.vocab*sizeof(__half), cudaMemcpyDeviceToHost);
         for (int v = 0; v < m.vocab; ++v) lf[v] = __half2float(logits[v]);
-        int next = sample_greedy(lf.data(), m.vocab);
+        return sample_greedy(lf.data(), m.vocab);
+    };
+
+    printf("\nprefill %d prompt tokens + generate %d (KV cache)...\n", prompt_len, n_gen);
+    // Prefill: whole prompt through the cache in one pass -> first token.
+    cudaMemcpy(d_ids, ids.data(), prompt_len*sizeof(int), cudaMemcpyHostToDevice);
+    forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.n_layers, batch_layers,
+                          m.rw, d_ids, prompt_len, 0, kv, m.vocab, bufs, s, pool, &gemm, cs, ms);
+    kv.len = prompt_len;
+    int next = sample_next();
+    ids.push_back(next);
+
+    // Decode: one token per step.
+    auto t0 = std::chrono::steady_clock::now();
+    for (int step = 1; step < n_gen; ++step) {
+        cudaMemcpy(d_ids, &next, sizeof(int), cudaMemcpyHostToDevice);
+        forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.n_layers, batch_layers,
+                              m.rw, d_ids, 1, kv.len, kv, m.vocab, bufs, s, pool, &gemm, cs, ms);
+        kv.len += 1;
+        next = sample_next();
         ids.push_back(next);
-        printf("  step %d -> token %d\n", step, next);
     }
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
+    int decoded = n_gen - 1;
 
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { printf("CUDA error: %s\n", cudaGetErrorString(e)); return 1; }
 
-    printf("\ngenerated ids:");
+    printf("generated ids:");
     for (int i = prompt_len; i < (int)ids.size(); ++i) printf(" %d", ids[i]);
     printf("\nfull sequence:");
     for (int id : ids) printf(" %d", id);
-    printf("\n%.2f tokens/s (%d tokens in %.2fs, no KV cache)\n", n_gen / secs, n_gen, secs);
+    if (decoded > 0) printf("\n%.2f tokens/s decode (%d tokens in %.2fs, KV cache)\n", decoded / secs, decoded, secs);
     report_mem("after gen");
 
+    cudaFree(kv.K); cudaFree(kv.V);
     slotpool_destroy(&pool); gemm_destroy(&gemm); free_model(&m);
     return 0;
 }

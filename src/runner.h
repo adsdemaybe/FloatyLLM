@@ -38,3 +38,12 @@ void forward_logits_q8(const LlamaConfig& cfg, const LayerBlob& blob,
                        int T, int vocab, RunnerBufs& bufs, LayerScratch& scratch,
                        SlotPool& pool, Gemm* gemm,
                        cudaStream_t copy_stream, cudaStream_t compute_stream);
+
+// Cached quantized forward: process n_new tokens with a KV cache (prefill n_new=prompt,
+// decode n_new=1). Logits are for the last of the n_new tokens.
+void forward_logits_cached(const LlamaConfig& cfg, const LayerBlob& blob,
+                           const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                           int batch_layers, const RunnerWeights& rw, const int* d_ids,
+                           int n_new, int len_before, KVCache& kv, int vocab,
+                           RunnerBufs& bufs, LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
+                           cudaStream_t copy_stream, cudaStream_t compute_stream);

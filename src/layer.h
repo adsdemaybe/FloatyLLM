@@ -26,3 +26,18 @@ struct LayerScratch {
 void layer_forward(const LlamaConfig& cfg, const LayerWeights& w,
                    __half* hidden, const int* d_positions, int n_tokens,
                    LayerScratch& s, Gemm* gemm, cudaStream_t stream);
+
+// Persistent K/V cache: K/V are [n_layers * max_T * (n_kv_heads*head_dim)].
+struct KVCache {
+    __half* K = nullptr;
+    __half* V = nullptr;
+    int n_layers = 0, max_T = 0, kvd = 0;
+    int len = 0;   // positions currently filled
+};
+
+// Cached decoder layer: process n_new tokens (abs positions d_positions), write their
+// K/V into cache[layer_idx] at len_before, attend the whole cache [0..len_before+n_new).
+void layer_forward_cached(const LlamaConfig& cfg, const LayerWeights& w,
+                          __half* hidden, const int* d_positions, int n_new,
+                          int layer_idx, int len_before, KVCache& kv,
+                          LayerScratch& s, Gemm* gemm, cudaStream_t stream);

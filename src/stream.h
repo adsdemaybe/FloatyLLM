@@ -51,3 +51,12 @@ void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
                        const int* d_positions, int n_tokens, LayerScratch& scratch,
                        SlotPool& pool, Gemm* gemm,
                        cudaStream_t copy_stream, cudaStream_t compute_stream);
+
+// Quantized streaming with KV cache: processes n_new tokens through every streamed
+// layer, using layer_forward_cached (append K/V at len_before, attend the cache).
+void stream_forward_q8_cached(const LlamaConfig& cfg, const LayerBlob& blob,
+                              const uint8_t* h_q8, size_t q8_layer_bytes, int n_layers,
+                              int batch_layers, __half* arena, __half* hidden,
+                              const int* d_positions, int n_new, int len_before, KVCache& kv,
+                              LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
+                              cudaStream_t copy_stream, cudaStream_t compute_stream);
