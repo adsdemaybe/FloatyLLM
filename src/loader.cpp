@@ -84,43 +84,37 @@ void read_value(Cursor& c, int type, MetaValue& mv) {
 
 }  // namespace
 
-bool gguf_load(const char* path, GgufFile* out, std::string* err) {
+// mmap + parse one shard; append its tensors (with shard index) to out.
+static bool parse_shard(const char* path, GgufFile* out, int shard_idx, bool first, std::string* err) {
     auto fail = [&](const char* m) { if (err) *err = m; return false; };
-
-    // mmap the file: the OS pages in only what's accessed and evicts under pressure,
-    // so we never hold the whole model in committed RAM.
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return fail("cannot open file");
+    if (fd < 0) return fail("cannot open shard");
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return fail("empty file"); }
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return fail("empty shard"); }
     size_t sz = (size_t)st.st_size;
     void* p = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) { close(fd); return fail("mmap failed"); }
     madvise(p, sz, MADV_SEQUENTIAL);
-    out->data = (const uint8_t*)p;
-    out->size = sz;
-    out->fd = fd;
+    Shard sh; sh.data = (const uint8_t*)p; sh.size = sz; sh.fd = fd;
 
-    Cursor c{out->data, 0, out->size};
-
-    uint32_t magic = c.read_scalar<uint32_t>();
-    if (magic != 0x46554747u) return fail("bad magic (not GGUF)");
-    out->version = c.read_scalar<uint32_t>();
-    if (out->version != 2 && out->version != 3) return fail("unsupported GGUF version");
+    Cursor c{sh.data, 0, sh.size};
+    auto bail = [&](const char* m) { munmap(p, sz); close(fd); return fail(m); };
+    if (c.read_scalar<uint32_t>() != 0x46554747u) return bail("bad magic (not GGUF)");
+    uint32_t ver = c.read_scalar<uint32_t>();
+    if (first) out->version = ver;
+    if (ver != 2 && ver != 3) return bail("unsupported GGUF version");
     uint64_t n_tensors = c.read_scalar<uint64_t>();
     uint64_t n_meta = c.read_scalar<uint64_t>();
-    if (!c.ok) return fail("truncated header");
+    if (!c.ok) return bail("truncated header");
 
     for (uint64_t i = 0; i < n_meta; ++i) {
         std::string key = c.read_string();
         uint32_t vtype = c.read_scalar<uint32_t>();
         MetaValue mv;
         read_value(c, (int)vtype, mv);
-        if (!c.ok) return fail("truncated metadata");
-        out->meta.emplace(std::move(key), std::move(mv));
+        if (!c.ok) return bail("truncated metadata");
+        if (first) out->meta.emplace(std::move(key), std::move(mv));
     }
-
-    out->tensors.reserve(n_tensors);
     for (uint64_t i = 0; i < n_tensors; ++i) {
         TensorInfo t;
         t.name = c.read_string();
@@ -128,25 +122,45 @@ bool gguf_load(const char* path, GgufFile* out, std::string* err) {
         for (uint32_t d = 0; d < nd && c.ok; ++d) t.dims.push_back(c.read_scalar<uint64_t>());
         t.ggml_type = c.read_scalar<uint32_t>();
         t.offset = c.read_scalar<uint64_t>();
-        if (!c.ok) return fail("truncated tensor info");
+        t.shard = shard_idx;
+        if (!c.ok) return bail("truncated tensor info");
         out->tensor_index[t.name] = (int)out->tensors.size();
         out->tensors.push_back(std::move(t));
     }
-
-    // Data section begins after alignment padding (general.alignment or 32).
     uint32_t align = 32;
-    { uint32_t a; if (gguf_get_u32(*out, "general.alignment", &a) && a) align = a; }
-    size_t off = c.pos;
-    off = (off + align - 1) / align * align;
-    if (off > out->size) return fail("data section past EOF");
-    out->data_offset = off;
+    { uint32_t a; if (first && gguf_get_u32(*out, "general.alignment", &a) && a) align = a; }
+    size_t off = (c.pos + align - 1) / align * align;
+    if (off > sh.size) return bail("data section past EOF");
+    sh.data_offset = off;
+    out->shards.push_back(sh);
+    return true;
+}
+
+bool gguf_load(const char* path, GgufFile* out, std::string* err) {
+    if (!parse_shard(path, out, 0, true, err)) return false;
+    // Split model? Load the remaining shards (foo-00001-of-000NN.gguf).
+    uint32_t cnt = 0;
+    if (gguf_get_u32(*out, "split.count", &cnt) && cnt > 1) {
+        std::string p(path);
+        size_t of = p.rfind("-of-");
+        if (of != std::string::npos && of >= 5) {
+            for (uint32_t k = 2; k <= cnt; ++k) {
+                std::string sp = p;
+                char num[8]; snprintf(num, sizeof(num), "%05u", k);
+                sp.replace(of - 5, 5, num);
+                if (!parse_shard(sp.c_str(), out, (int)k - 1, false, err)) return false;
+            }
+        }
+    }
     return true;
 }
 
 void gguf_close(GgufFile* g) {
-    if (g->data && g->size) munmap((void*)g->data, g->size);
-    if (g->fd >= 0) close(g->fd);
-    g->data = nullptr; g->size = 0; g->fd = -1;
+    for (auto& sh : g->shards) {
+        if (sh.data && sh.size) munmap((void*)sh.data, sh.size);
+        if (sh.fd >= 0) close(sh.fd);
+    }
+    g->shards.clear();
 }
 
 bool gguf_get_u32(const GgufFile& g, const std::string& key, uint32_t* v) {
@@ -179,7 +193,8 @@ const TensorInfo* gguf_find_tensor(const GgufFile& g, const std::string& name) {
 }
 
 const uint8_t* gguf_tensor_data(const GgufFile& g, const TensorInfo& t) {
-    return g.data + g.data_offset + t.offset;
+    const Shard& sh = g.shards[t.shard];
+    return sh.data + sh.data_offset + t.offset;
 }
 
 uint64_t gguf_tensor_elements(const TensorInfo& t) {

@@ -29,18 +29,23 @@ struct TensorInfo {
     std::string name;
     uint32_t ggml_type = 0;
     std::vector<uint64_t> dims;
-    uint64_t offset = 0;       // relative to the data section start
+    uint64_t offset = 0;       // relative to its shard's data section start
+    int shard = 0;             // which shard holds this tensor's data
+};
+
+struct Shard {
+    const uint8_t* data = nullptr;   // mmap'd file (disk-backed)
+    size_t size = 0;
+    int fd = -1;
+    size_t data_offset = 0;          // start of this shard's tensor data
 };
 
 struct GgufFile {
     uint32_t version = 0;
-    const uint8_t* data = nullptr;                       // mmap'd file (disk-backed)
-    size_t size = 0;
-    int fd = -1;
-    std::unordered_map<std::string, MetaValue> meta;
-    std::vector<TensorInfo> tensors;
+    std::vector<Shard> shards;                           // one per split file
+    std::unordered_map<std::string, MetaValue> meta;     // from shard 0
+    std::vector<TensorInfo> tensors;                     // merged across shards
     std::unordered_map<std::string, int> tensor_index;   // name -> index in tensors
-    size_t data_offset = 0;                              // start of tensor data in bytes
 };
 
 // Load + parse a GGUF file (mmap, not read into RAM). Returns false + *err on failure.
