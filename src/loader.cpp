@@ -3,6 +3,10 @@
 #include "loader.h"
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -83,18 +87,21 @@ void read_value(Cursor& c, int type, MetaValue& mv) {
 bool gguf_load(const char* path, GgufFile* out, std::string* err) {
     auto fail = [&](const char* m) { if (err) *err = m; return false; };
 
-    FILE* f = fopen(path, "rb");
-    if (!f) return fail("cannot open file");
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return fail("empty file"); }
-    out->bytes.resize((size_t)sz);
-    size_t got = fread(out->bytes.data(), 1, (size_t)sz, f);
-    fclose(f);
-    if (got != (size_t)sz) return fail("short read");
+    // mmap the file: the OS pages in only what's accessed and evicts under pressure,
+    // so we never hold the whole model in committed RAM.
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return fail("cannot open file");
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return fail("empty file"); }
+    size_t sz = (size_t)st.st_size;
+    void* p = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) { close(fd); return fail("mmap failed"); }
+    madvise(p, sz, MADV_SEQUENTIAL);
+    out->data = (const uint8_t*)p;
+    out->size = sz;
+    out->fd = fd;
 
-    Cursor c{out->bytes.data(), 0, out->bytes.size()};
+    Cursor c{out->data, 0, out->size};
 
     uint32_t magic = c.read_scalar<uint32_t>();
     if (magic != 0x46554747u) return fail("bad magic (not GGUF)");
@@ -131,9 +138,15 @@ bool gguf_load(const char* path, GgufFile* out, std::string* err) {
     { uint32_t a; if (gguf_get_u32(*out, "general.alignment", &a) && a) align = a; }
     size_t off = c.pos;
     off = (off + align - 1) / align * align;
-    if (off > out->bytes.size()) return fail("data section past EOF");
+    if (off > out->size) return fail("data section past EOF");
     out->data_offset = off;
     return true;
+}
+
+void gguf_close(GgufFile* g) {
+    if (g->data && g->size) munmap((void*)g->data, g->size);
+    if (g->fd >= 0) close(g->fd);
+    g->data = nullptr; g->size = 0; g->fd = -1;
 }
 
 bool gguf_get_u32(const GgufFile& g, const std::string& key, uint32_t* v) {
@@ -166,7 +179,7 @@ const TensorInfo* gguf_find_tensor(const GgufFile& g, const std::string& name) {
 }
 
 const uint8_t* gguf_tensor_data(const GgufFile& g, const TensorInfo& t) {
-    return g.bytes.data() + g.data_offset + t.offset;
+    return g.data + g.data_offset + t.offset;
 }
 
 uint64_t gguf_tensor_elements(const TensorInfo& t) {

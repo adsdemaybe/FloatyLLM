@@ -34,15 +34,18 @@ struct TensorInfo {
 
 struct GgufFile {
     uint32_t version = 0;
-    std::vector<uint8_t> bytes;                          // whole file, owned
+    const uint8_t* data = nullptr;                       // mmap'd file (disk-backed)
+    size_t size = 0;
+    int fd = -1;
     std::unordered_map<std::string, MetaValue> meta;
     std::vector<TensorInfo> tensors;
     std::unordered_map<std::string, int> tensor_index;   // name -> index in tensors
     size_t data_offset = 0;                              // start of tensor data in bytes
 };
 
-// Load + parse a GGUF file. Returns false and sets *err on failure.
+// Load + parse a GGUF file (mmap, not read into RAM). Returns false + *err on failure.
 bool gguf_load(const char* path, GgufFile* out, std::string* err);
+void gguf_close(GgufFile* g);   // munmap
 
 // Typed metadata getters. Return false if the key is missing or the wrong type.
 bool gguf_get_u32(const GgufFile& g, const std::string& key, uint32_t* v);

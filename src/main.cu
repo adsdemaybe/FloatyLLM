@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
         printf("MoE: arch=%s layers=%d dim=%d experts=%d/%d expert_ffn=%d vocab=%d | %.1f GB Q%d\n",
                mm.arch.c_str(), mm.n_layers, mm.cfg.dim, mm.mcfg.n_used, mm.mcfg.n_experts,
                mm.mcfg.expert_ffn, mm.vocab, mm.q_layer_bytes/1e9*mm.n_layers, mm.q_bits);
+        gguf_close(&g);   // weights extracted; release the mmap
         report_mem("after load");
         int nsl = 2, bl = 1;
         const char* se = getenv("SEMILLM_SLOTS"); if (se && atoi(se) >= 2) nsl = atoi(se);
@@ -53,6 +54,7 @@ int main(int argc, char** argv) {
 
     LoadedModel m;
     if (!load_model(g, &m, q_bits, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
+    gguf_close(&g);   // weights extracted; release the mmap
     const LlamaConfig& cfg = m.cfg;
     printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB Q%d streamed (vs %.1f GB fp16)\n",
            m.arch.c_str(), m.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim,
