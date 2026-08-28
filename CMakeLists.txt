@@ -25,3 +25,31 @@ enable_testing()
 add_executable(test_dequant tests/test_dequant.cu)
 target_link_libraries(test_dequant PRIVATE semillm_core)
 add_test(NAME dequant COMMAND test_dequant)
+
+add_executable(test_rmsnorm tests/test_rmsnorm.cu)
+target_link_libraries(test_rmsnorm PRIVATE semillm_core)
+add_test(NAME rmsnorm COMMAND test_rmsnorm)
+
+add_executable(test_rope tests/test_rope.cu)
+target_link_libraries(test_rope PRIVATE semillm_core)
+add_test(NAME rope COMMAND test_rope)
+
+add_executable(test_elementwise tests/test_elementwise.cu)
+target_link_libraries(test_elementwise PRIVATE semillm_core)
+add_test(NAME elementwise COMMAND test_elementwise)
+
+add_executable(test_softmax tests/test_softmax.cu)
+target_link_libraries(test_softmax PRIVATE semillm_core)
+add_test(NAME softmax COMMAND test_softmax)
+
+add_executable(test_attention tests/test_attention.cu)
+target_link_libraries(test_attention PRIVATE semillm_core)
+add_test(NAME attention COMMAND test_attention)
+
+add_executable(test_gemm tests/test_gemm.cu)
+target_link_libraries(test_gemm PRIVATE semillm_core)
+add_test(NAME gemm COMMAND test_gemm)
+
+add_executable(test_layer tests/test_layer.cu)
+target_link_libraries(test_layer PRIVATE semillm_core)
+add_test(NAME layer COMMAND test_layer)
