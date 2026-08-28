@@ -37,9 +37,9 @@ int main() {
 
     std::vector<__half> Q(T*H*D), K(T*KVH*D), V(T*KVH*D), out(T*H*D);
     std::vector<float> Qf(T*H*D), Kf(T*KVH*D), Vf(T*KVH*D), expected(T*H*D);
-    for (size_t i = 0; i < Q.size(); ++i) { float v = 0.1f*(float)((i*5)%29-14); Q[i]=__float2half(v); Qf[i]=__half2float(Q[i]); }
-    for (size_t i = 0; i < K.size(); ++i) { float v = 0.1f*(float)((i*3)%23-11); K[i]=__float2half(v); Kf[i]=__half2float(K[i]); }
-    for (size_t i = 0; i < V.size(); ++i) { float v = 0.1f*(float)((i*7)%31-15); V[i]=__float2half(v); Vf[i]=__half2float(V[i]); }
+    for (size_t i = 0; i < Q.size(); ++i) { float v = 0.1f*(float)((int)((i*5)%29) - 14); Q[i]=__float2half(v); Qf[i]=__half2float(Q[i]); }
+    for (size_t i = 0; i < K.size(); ++i) { float v = 0.1f*(float)((int)((i*3)%23) - 11); K[i]=__float2half(v); Kf[i]=__half2float(K[i]); }
+    for (size_t i = 0; i < V.size(); ++i) { float v = 0.1f*(float)((int)((i*7)%31) - 15); V[i]=__float2half(v); Vf[i]=__half2float(V[i]); }
 
     attention_ref(Qf.data(), Kf.data(), Vf.data(), expected.data(), T, H, KVH, D, scale);
 
