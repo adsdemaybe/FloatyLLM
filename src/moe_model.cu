@@ -27,6 +27,7 @@ void block_info(uint32_t type, size_t* be, size_t* bb) {
         case GGML_Q8_0: *be = 32;  *bb = 34;  break;
         case GGML_Q4_0: *be = 32;  *bb = 18;  break;
         case GGML_Q5_0: *be = 32;  *bb = 22;  break;
+        case GGML_Q3_K: *be = 256; *bb = 110; break;
         case GGML_Q4_K: *be = 256; *bb = 144; break;
         case GGML_Q5_K: *be = 256; *bb = 176; break;
         case GGML_Q6_K: *be = 256; *bb = 210; break;
@@ -318,7 +319,7 @@ static bool dense_decode_supported(LoadedMoeModel& m) {
         for (auto& mr : layer)
             if (!mr.is_norm) {
                 uint32_t t = mr.type;
-                if (t != 8 && t != 12 && t != 13 && t != 14) return false;  // Q8_0/Q4_K/Q5_K/Q6_K
+                if (t != 8 && t != 11 && t != 12 && t != 13 && t != 14) return false;  // Q8_0/Q3_K/Q4_K/Q5_K/Q6_K
             }
     return true;
 }
