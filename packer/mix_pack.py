@@ -42,10 +42,12 @@ def build_schedule(spec, n_layers, n_src):
             sys.exit(f"csv schedule has {len(vals)} entries, need {n_layers}")
         return vals
     if spec.startswith("ends:"):
-        # ends:HI,mid:LO  -> outer 25% each end at tier HI, middle at tier LO
+        # ends:HI,mid:LO[,edge:N] -> outer N layers each end at tier HI, middle at LO.
+        # N defaults to n_layers//4; a small N (e.g. 4) keeps the model near the LO size
+        # (fast) while protecting the most quant-sensitive first/last layers at HI bits.
         parts = dict(p.split(":") for p in spec.split(","))
         hi_t = int(parts["ends"]); lo_t = int(parts.get("mid", "0"))
-        edge = max(1, n_layers // 4)
+        edge = int(parts.get("edge", str(max(1, n_layers // 4))))
         return [hi_t if (L < edge or L >= n_layers - edge) else lo_t for L in range(n_layers)]
     sys.exit(f"unknown schedule '{spec}'")
 
