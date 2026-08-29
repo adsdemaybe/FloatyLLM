@@ -102,14 +102,14 @@ bool load_moe_model(const GgufFile& g, LoadedMoeModel* out, std::string* err) {
         auto find = [&](const char* fmt, int e = -1) -> const TensorInfo* {
             if (e < 0) snprintf(nm, sizeof(nm), fmt, L); else snprintf(nm, sizeof(nm), fmt, L, e);
             return gguf_find_tensor(g, nm); };
-        auto add = [&](const TensorInfo* t, size_t chunk_elems, int o, int in, size_t arena_off, bool is_norm) -> bool {
+        auto add = [&](const TensorInfo* t, size_t chunk_elems, int o, int in, size_t arena_off, bool is_norm, int expert = -1) -> bool {
             if (!t) return false;
             size_t be, bb; block_info(t->ggml_type, &be, &bb);
             if (be == 0) { if (err) *err = std::string("unsupported quant in ") + t->name; return false; }
             MatRef mr; mr.type = t->ggml_type; mr.out = o; mr.in = in;
             mr.n_elems = (size_t)o * in; mr.quant_bytes = (mr.n_elems / be) * bb;
             mr.src = gguf_tensor_data(g, *t) + (chunk_elems / be) * bb;
-            mr.arena_off = arena_off; mr.is_norm = is_norm;
+            mr.arena_off = arena_off; mr.is_norm = is_norm; mr.expert = expert;
             if (mr.quant_bytes > out->max_quant_bytes) out->max_quant_bytes = mr.quant_bytes;
             if (mr.n_elems > out->max_elems) out->max_elems = mr.n_elems;
             ms.push_back(mr); return true; };
@@ -132,13 +132,13 @@ bool load_moe_model(const GgufFile& g, LoadedMoeModel* out, std::string* err) {
             size_t eb = out->blob.off_experts + (size_t)e*out->blob.expert_stride;
             const TensorInfo *gpe = find("blk.%d.ffn_gate.%d.weight", e), *upe = find("blk.%d.ffn_up.%d.weight", e), *dpe = find("blk.%d.ffn_down.%d.weight", e);
             if (gpe && upe && dpe) {
-                weight_out_in(*gpe,&o,&in); if(!add(gpe,0,o,in,eb+out->blob.off_egate,false)) return false;
-                weight_out_in(*upe,&o,&in); if(!add(upe,0,o,in,eb+out->blob.off_eup,false)) return false;
-                weight_out_in(*dpe,&o,&in); if(!add(dpe,0,o,in,eb+out->blob.off_edown,false)) return false;
+                weight_out_in(*gpe,&o,&in); if(!add(gpe,0,o,in,eb+out->blob.off_egate,false,e)) return false;
+                weight_out_in(*upe,&o,&in); if(!add(upe,0,o,in,eb+out->blob.off_eup,false,e)) return false;
+                weight_out_in(*dpe,&o,&in); if(!add(dpe,0,o,in,eb+out->blob.off_edown,false,e)) return false;
             } else if (ge && ue && de) {
-                if(!add(ge,(size_t)e*dim*ef,ef,dim,eb+out->blob.off_egate,false)) return false;
-                if(!add(ue,(size_t)e*dim*ef,ef,dim,eb+out->blob.off_eup,false)) return false;
-                if(!add(de,(size_t)e*ef*dim,dim,ef,eb+out->blob.off_edown,false)) return false;
+                if(!add(ge,(size_t)e*dim*ef,ef,dim,eb+out->blob.off_egate,false,e)) return false;
+                if(!add(ue,(size_t)e*dim*ef,ef,dim,eb+out->blob.off_eup,false,e)) return false;
+                if(!add(de,(size_t)e*ef*dim,dim,ef,eb+out->blob.off_edown,false,e)) return false;
             } else { if (err) *err = "missing expert tensors"; return false; }
         }
     }
@@ -201,21 +201,27 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
     Gemm gemm; gemm_create(&gemm);
     std::vector<__half> hl(m.vocab); std::vector<float> lf(m.vocab);
 
-    auto stream_layer = [&](int L) {
-        for (const MatRef& mr : m.layers[L]) {
-            cudaMemcpyAsync(d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, cm);
-            if (mr.is_norm) dequant_to_fp16(d_qstage, arena + mr.arena_off, mr.type, mr.n_elems, cm);
-            else { dequant_to_fp16(d_qstage, d_deq, mr.type, mr.n_elems, cm);
-                   transpose_fp16(d_deq, arena + mr.arena_off, mr.out, mr.in, cm); }
-        }
+    auto stream_mat = [&](const MatRef& mr) {
+        cudaMemcpyAsync(d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, cm);
+        if (mr.is_norm) dequant_to_fp16(d_qstage, arena + mr.arena_off, mr.type, mr.n_elems, cm);
+        else { dequant_to_fp16(d_qstage, d_deq, mr.type, mr.n_elems, cm);
+               transpose_fp16(d_deq, arena + mr.arena_off, mr.out, mr.in, cm); }
     };
+    // Active-expert streaming (PLAN sec 16): stream attn + router, route, then stream
+    // ONLY the experts the router selected (n_used per token, not all n_experts).
+    long exp_streamed = 0, exp_total = 0;
     auto forward = [&](const int* d_tok, int n_new, int len_before) {
         std::vector<int> pos(n_new); for (int i=0;i<n_new;++i) pos[i]=len_before+i;
         cudaMemcpy(positions, pos.data(), n_new*4, cudaMemcpyHostToDevice);
         embed_tokens(m.rw.token_embd, d_tok, hidden, n_new, dim, cm);
+        int active[256];
         for (int L=0; L<m.n_layers; ++L) {
-            stream_layer(L);
-            moe_layer_forward_cached(cfg, mc, w, hidden, positions, n_new, L, len_before, kv, s, ms, &gemm, cm);
+            for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) stream_mat(mr);   // attn + router
+            int na = moe_attn_route(cfg, mc, w, hidden, positions, n_new, L, len_before, kv, s, ms, &gemm, cm, active, 256);
+            for (int a=0; a<na; ++a)
+                for (const MatRef& mr : m.layers[L]) if (mr.expert == active[a]) stream_mat(mr);   // active experts only
+            moe_experts_out(cfg, mc, w, hidden, n_new, s, ms, &gemm, cm, active, na);
+            exp_streamed += na; exp_total += E;
         }
         rmsnorm(hidden, m.rw.final_norm, normed, n_new, dim, cfg.eps, cm);
         gemm_rowmajor(&gemm, m.rw.output, normed+(size_t)(n_new-1)*dim, logits_d, m.vocab, 1, dim, cm);
@@ -240,6 +246,9 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { if (err) *err = cudaGetErrorString(e); return false; }
     if (n_gen > 1) printf("%.2f tokens/s decode\n", (n_gen-1)/secs);
+    if (exp_total > 0)
+        printf("active-expert streaming: %ld / %ld expert-loads (%.1f%% of dense), %d/%d used/layer\n",
+               exp_streamed, exp_total, 100.0 * exp_streamed / exp_total, mc.n_used, E);
 
     cudaFree(kv.K); cudaFree(kv.V); gemm_destroy(&gemm); free_moe_model(&m);
     return true;

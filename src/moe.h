@@ -48,7 +48,22 @@ struct MoeScratch {
     float*  h_route;  // pinned host [n_new * n_experts] (to pick active experts)
 };
 
-// Cached MoE decoder layer: attention (KV cache) + router + experts (+ shared).
+// Split MoE layer for active-expert streaming (PLAN sec 16): run attention + router,
+// return the active experts in active[0..ret) (any token routed to them, <= max_active).
+// Leaves the ffn-normed expert input in s.xn for moe_experts_out. The caller streams
+// ONLY these experts' weights, then calls moe_experts_out.
+int moe_attn_route(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                   __half* hidden, const int* d_positions, int n_new, int layer_idx, int len_before,
+                   KVCache& kv, LayerScratch& s, MoeScratch& ms, Gemm* gemm, cudaStream_t stream,
+                   int* active, int max_active);
+
+// Expert FFN over active[0..n_active) + optional shared expert + residual into hidden.
+// Reads s.xn (set by moe_attn_route); wgate/wup/wdown[e] must be valid for each active e.
+void moe_experts_out(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                     __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
+                     cudaStream_t stream, const int* active, int n_active);
+
+// Cached MoE decoder layer (all experts resident): attention (KV cache) + router + experts.
 void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
                               const MoeLayerWeights& w, __half* hidden, const int* d_positions,
                               int n_new, int layer_idx, int len_before, KVCache& kv,

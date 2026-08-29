@@ -83,10 +83,10 @@ void moe_mlp(Gemm* g, const __half* x, const __half* const* wgate,
     }
 }
 
-void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
-                              const MoeLayerWeights& w, __half* hidden, const int* d_positions,
-                              int n_new, int layer_idx, int len_before, KVCache& kv,
-                              LayerScratch& s, MoeScratch& ms, Gemm* gemm, cudaStream_t stream) {
+int moe_attn_route(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                   __half* hidden, const int* d_positions, int n_new, int layer_idx, int len_before,
+                   KVCache& kv, LayerScratch& s, MoeScratch& ms, Gemm* gemm, cudaStream_t stream,
+                   int* active, int max_active) {
     int dim = cfg.dim, qd = cfg.n_heads * cfg.head_dim, kvd = cfg.n_kv_heads * cfg.head_dim;
     float scale = 1.0f / sqrtf((float)cfg.head_dim);
 
@@ -106,20 +106,29 @@ void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
     gemm_rowmajor(gemm, s.att, w.wo, s.proj, n_new, dim, qd, stream);
     residual_add(hidden, s.proj, n_new * dim, stream);
 
-    // --- MoE MLP block ---
+    // --- router: ffn_norm(-> s.xn) then top-k gate. s.xn is the expert-block input,
+    // preserved for the caller's moe_experts_out (survives expert streaming). ---
     rmsnorm(hidden, w.ffn_norm, s.xn, n_new, dim, cfg.eps, stream);
     moe_router(gemm, s.xn, w.w_gate, ms.logits, ms.route_w, n_new, dim,
                mcfg.n_experts, mcfg.n_used, stream);
-    // Pick the active experts (any token routed to them) so only those FFNs run.
+    // Pick the active experts (any token routed to them). For decode (n_new=1) this is
+    // exactly n_used experts -> the caller streams only those, not all n_experts.
     cudaMemcpyAsync(ms.h_route, ms.route_w, (size_t)n_new * mcfg.n_experts * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
-    int active[256], n_active = 0;
-    for (int e = 0; e < mcfg.n_experts && e < 256; ++e) {
+    int n_active = 0;
+    for (int e = 0; e < mcfg.n_experts && n_active < max_active; ++e) {
         bool used = false;
         for (int tk = 0; tk < n_new; ++tk) if (ms.h_route[(size_t)tk * mcfg.n_experts + e] != 0.0f) { used = true; break; }
         if (used) active[n_active++] = e;
     }
+    return n_active;
+}
+
+void moe_experts_out(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                     __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
+                     cudaStream_t stream, const int* active, int n_active) {
+    int dim = cfg.dim;
     moe_mlp(gemm, s.xn, w.wgate, w.wup, w.wdown, ms.route_w, ms.moe_out,
             ms.gate, ms.up, ms.ye, n_new, dim, mcfg.expert_ffn, mcfg.n_experts, active, n_active, stream);
 
@@ -133,4 +142,16 @@ void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
         residual_add(ms.moe_out, ms.ye, n_new * dim, stream);
     }
     residual_add(hidden, ms.moe_out, n_new * dim, stream);
+}
+
+// Convenience wrapper (all experts resident): route then run. Streaming callers use
+// moe_attn_route + moe_experts_out directly so they can stream only the active experts.
+void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
+                              const MoeLayerWeights& w, __half* hidden, const int* d_positions,
+                              int n_new, int layer_idx, int len_before, KVCache& kv,
+                              LayerScratch& s, MoeScratch& ms, Gemm* gemm, cudaStream_t stream) {
+    int active[256];
+    int n_active = moe_attn_route(cfg, mcfg, w, hidden, d_positions, n_new, layer_idx, len_before,
+                                  kv, s, ms, gemm, stream, active, 256);
+    moe_experts_out(cfg, mcfg, w, hidden, n_new, s, ms, gemm, stream, active, n_active);
 }
