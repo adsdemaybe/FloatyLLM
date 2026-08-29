@@ -11,6 +11,8 @@
 #include <vector>
 #include <string>
 #include <chrono>
+#include <iostream>
+#include <utility>
 
 // `semillm tokenize <model.gguf> <text...>` — encode text to ids using the native SPM
 // tokenizer (verify vs `llama-tokenize --ids`). Also detokenizes back as a round-trip check.
@@ -36,10 +38,90 @@ static void report_mem(const char* tag) {
     printf("[mem] %-13s free=%.2f GB / total=%.2f GB\n", tag, freeb / 1e9, totalb / 1e9);
 }
 
+// `semillm run <model.gguf> [-p TEXT | -it] [-n N] [--temp T] [--budget GB] [--ctx N]`
+// vLLM-style flags + an ollama-style interactive chat TUI (multi-turn, KV persists).
+static int cmd_run(int argc, char** argv) {
+    std::string model, prompt; int n_pred = 256, ctx = 4096; float temp = 0.0f; double budget = 8.0; bool interactive = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-it" || a == "--interactive") interactive = true;
+        else if ((a == "-p" || a == "--prompt") && i+1 < argc) prompt = argv[++i];
+        else if ((a == "-n" || a == "--n-predict") && i+1 < argc) n_pred = atoi(argv[++i]);
+        else if (a == "--temp" && i+1 < argc) temp = (float)atof(argv[++i]);
+        else if (a == "--budget" && i+1 < argc) budget = atof(argv[++i]);
+        else if (a == "--ctx" && i+1 < argc) ctx = atoi(argv[++i]);
+        else if (!a.empty() && a[0] != '-' && model.empty()) model = a;
+        else { printf("unknown arg: %s\n", a.c_str()); return 2; }
+    }
+    if (model.empty()) { printf("usage: %s run <model.gguf> [-p TEXT | -it] [-n N] [--temp T] [--budget GB] [--ctx N]\n", argv[0]); return 2; }
+    if (prompt.empty() && !interactive) interactive = true;   // no prompt => chat
+
+    GgufFile g; std::string err;
+    if (!gguf_load(model.c_str(), &g, &err)) { printf("gguf_load: %s\n", err.c_str()); return 1; }
+    if (!is_moe_model(g)) { printf("run/chat currently supports MoE models (the streaming target); use the token-id path for dense.\n"); gguf_close(&g); return 1; }
+    LoadedMoeModel m;
+    if (!load_moe_model(g, &m, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
+    Tokenizer tok;
+    if (!tokenizer_load(model.c_str(), &tok, &err)) { printf("tokenizer: %s\n", err.c_str()); gguf_close(&g); return 1; }
+    MoeSession S;
+    if (!moe_session_init(m, ctx, budget, &S, &err)) { printf("session: %s\n", err.c_str()); return 1; }
+
+    printf("\n  SemiLLM · %s · %d experts (%d used) · %d layers · %.0f GB fp16 streamed from disk\n",
+           m.arch.c_str(), m.mcfg.n_experts, m.mcfg.n_used, m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
+    printf("  ctx=%d  budget=%.0f GB  temp=%.2f%s\n", ctx, budget, temp,
+           interactive ? "   (/bye to exit, /reset to clear context)" : "");
+
+    std::vector<std::pair<std::string, std::string>> msgs;
+    std::string prev_fmt;
+    srand(1234);
+    auto run_turn = [&](const std::string& user) {
+        msgs.push_back({"user", user});
+        std::string fmt = tokenizer_apply_chat(tok, msgs, true);
+        if (fmt.empty()) fmt = prev_fmt + user;              // no chat template: treat as raw text
+        std::string delta = fmt.size() >= prev_fmt.size() ? fmt.substr(prev_fmt.size()) : fmt;
+        std::vector<int> ids = tokenizer_encode(tok, delta, /*add_special=*/S.len == 0);
+        if (ids.empty()) { printf("[empty prompt]\n"); return; }
+        if (!moe_session_eval(S, ids.data(), (int)ids.size(), &err)) { printf("[eval: %s]\n", err.c_str()); return; }
+        std::string reply;
+        auto t0 = std::chrono::steady_clock::now();
+        int steps = 0;
+        for (; steps < n_pred; ++steps) {
+            int next = moe_session_sample(S, temp, (float)rand() / ((float)RAND_MAX + 1.0f));
+            if (tokenizer_is_eog(tok, next)) break;
+            std::string piece = tokenizer_piece(tok, next);
+            fputs(piece.c_str(), stdout); fflush(stdout); reply += piece;
+            if (!moe_session_eval(S, &next, 1, &err)) { printf("\n[eval: %s]\n", err.c_str()); break; }
+        }
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        printf("\n\033[2m[%d tok, %.2f tok/s]\033[0m\n", steps, steps / (secs > 0 ? secs : 1));
+        msgs.push_back({"assistant", reply});
+        prev_fmt = tokenizer_apply_chat(tok, msgs, false);
+    };
+
+    if (interactive) {
+        std::string line;
+        while (true) {
+            fputs("\n>>> ", stdout); fflush(stdout);
+            if (!std::getline(std::cin, line)) break;
+            if (line == "/bye" || line == "/exit") break;
+            if (line == "/reset") { msgs.clear(); prev_fmt.clear(); moe_session_reset(S); printf("(context cleared)\n"); continue; }
+            if (line.empty()) continue;
+            run_turn(line);
+        }
+    } else {
+        run_turn(prompt);
+    }
+    if (S.exp_total > 0) printf("\n[active-expert streaming: %.1f%% of dense expert I/O]\n", 100.0 * S.exp_streamed / S.exp_total);
+    moe_session_free(&S); tokenizer_free(&tok); free_moe_model(&m); gguf_close(&g);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "tokenize") return cmd_tokenize(argc, argv);
-    if (argc < 4) { printf("usage: %s <model.gguf> <n_generate> <tok0> [tok1 ...]\n"
-                           "       %s tokenize <model.gguf> <text...>\n", argv[0], argv[0]); return 2; }
+    if (argc >= 2 && (std::string(argv[1]) == "run" || std::string(argv[1]) == "chat")) return cmd_run(argc, argv);
+    if (argc < 4) { printf("usage: %s <model.gguf> <n_generate> <tok0> [tok1 ...]   (raw token ids)\n"
+                           "       %s run <model.gguf> [-p TEXT | -it] [-n N] [--temp T] [--budget GB] [--ctx N]\n"
+                           "       %s tokenize <model.gguf> <text...>\n", argv[0], argv[0], argv[0]); return 2; }
     int n_gen = atoi(argv[2]);
     std::vector<int> ids;
     for (int i = 3; i < argc; ++i) ids.push_back(atoi(argv[i]));

@@ -37,6 +37,23 @@ std::string tokenizer_piece(const Tokenizer& t, int id) {
     return n > 0 ? std::string(buf, n) : "";
 }
 
+int  tokenizer_bos(const Tokenizer& t) { return t.ok ? llama_vocab_bos(t.vocab) : 1; }
+int  tokenizer_eos(const Tokenizer& t) { return t.ok ? llama_vocab_eos(t.vocab) : 2; }
+bool tokenizer_is_eog(const Tokenizer& t, int id) { return t.ok && llama_vocab_is_eog(t.vocab, id); }
+
+std::string tokenizer_apply_chat(const Tokenizer& t,
+                                 const std::vector<std::pair<std::string, std::string>>& msgs,
+                                 bool add_assistant) {
+    if (!t.ok) return "";
+    const char* tmpl = llama_model_chat_template(t.model, nullptr);   // model's built-in template
+    std::vector<llama_chat_message> chat(msgs.size());
+    for (size_t i = 0; i < msgs.size(); ++i) { chat[i].role = msgs[i].first.c_str(); chat[i].content = msgs[i].second.c_str(); }
+    std::vector<char> buf(4096);
+    int n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), add_assistant, buf.data(), (int)buf.size());
+    if (n > (int)buf.size()) { buf.resize(n); n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), add_assistant, buf.data(), (int)buf.size()); }
+    return n > 0 ? std::string(buf.data(), n) : "";
+}
+
 void tokenizer_free(Tokenizer* t) {
     if (t->model) { llama_model_free(t->model); t->model = nullptr; t->vocab = nullptr; t->ok = false; }
 }
@@ -49,6 +66,10 @@ bool tokenizer_load(const char*, Tokenizer*, std::string* err) {
 }
 std::vector<int> tokenizer_encode(const Tokenizer&, const std::string&, bool) { return {}; }
 std::string tokenizer_piece(const Tokenizer&, int) { return ""; }
+int  tokenizer_bos(const Tokenizer&) { return 1; }
+int  tokenizer_eos(const Tokenizer&) { return 2; }
+bool tokenizer_is_eog(const Tokenizer&, int) { return false; }
+std::string tokenizer_apply_chat(const Tokenizer&, const std::vector<std::pair<std::string, std::string>>&, bool) { return ""; }
 void tokenizer_free(Tokenizer*) {}
 
 #endif

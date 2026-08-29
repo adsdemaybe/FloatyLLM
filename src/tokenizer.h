@@ -6,6 +6,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <utility>
 
 struct llama_model;
 struct llama_vocab;
@@ -25,5 +26,16 @@ std::vector<int> tokenizer_encode(const Tokenizer& t, const std::string& text, b
 
 // One token id -> its text piece (special tokens rendered as empty by default).
 std::string tokenizer_piece(const Tokenizer& t, int id);
+
+int  tokenizer_bos(const Tokenizer& t);
+int  tokenizer_eos(const Tokenizer& t);
+bool tokenizer_is_eog(const Tokenizer& t, int id);   // end-of-generation (EOS or variants)
+
+// Render conversation messages with the model's built-in chat template. Each message is
+// (role, content) with role in {"system","user","assistant"}. add_assistant appends the
+// assistant header so the model continues as the assistant. Empty string on failure.
+std::string tokenizer_apply_chat(const Tokenizer& t,
+                                 const std::vector<std::pair<std::string, std::string>>& msgs,
+                                 bool add_assistant);
 
 void tokenizer_free(Tokenizer* t);

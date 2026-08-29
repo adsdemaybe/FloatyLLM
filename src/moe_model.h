@@ -47,3 +47,27 @@ void free_moe_model(LoadedMoeModel* m);
 // derived from it and the per-layer size (dynamic). Appends generated ids to *ids.
 bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen,
                   double budget_gb, std::string* err);
+
+// --- Persistent session: load once, evaluate many times with the KV cache kept, so a
+// REPL/chat can keep conversation context across turns (PLAN sec 6). ---
+struct MoeSession {
+    LoadedMoeModel* m = nullptr;
+    int max_T = 0, len = 0;                 // len = tokens already in the KV cache
+    double budget_gb = 0;
+    __half *hidden = nullptr, *normed = nullptr, *arena = nullptr, *d_deq = nullptr, *logits_d = nullptr;
+    uint8_t* d_qstage = nullptr; int* positions = nullptr; int* d_ids = nullptr;
+    LayerScratch s{}; MoeScratch ms{}; KVCache kv{};
+    std::vector<const __half*> wg, wu, wd; MoeLayerWeights w{};
+    cudaStream_t cm = nullptr, cs = nullptr; std::vector<cudaEvent_t> ev; Gemm gemm{};
+    std::vector<__half> hl; std::vector<float> lf;
+    long exp_streamed = 0, exp_total = 0;   // instrumentation across all evals
+};
+
+bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession* S, std::string* err);
+// Evaluate n_new host-side token ids at the current KV position; updates logits for the
+// LAST token and advances len by n_new. Returns false on a CUDA error.
+bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err);
+// Sample from the last logits (temp <= 0 => greedy; rand01 in [0,1) for temperature).
+int  moe_session_sample(MoeSession& S, float temp, float rand01);
+void moe_session_reset(MoeSession& S);      // clear conversation (len = 0)
+void moe_session_free(MoeSession* S);       // frees session buffers, NOT the model
