@@ -13,6 +13,9 @@ void moe_router(Gemm* g, const __half* x, const __half* w_gate, __half* logits_T
                 float* route_w, int T, int dim, int n_experts, int topk,
                 cudaStream_t stream);
 
+// Dense single-expert routing: set route_w[0..T) = 1.0 (every token uses expert 0).
+void moe_route_ones(float* route_w, int n, cudaStream_t stream);
+
 // MoE MLP: out[T,dim] = sum_e route_w[:,e] * down_e(silu(gate_e(x)) * up_e(x)).
 // Computes ONLY the active experts (active[0..n_active), the ones any token routed
 // to) - so decode with top-k does k expert FFNs, not n_experts. wgate/wup/wdown:

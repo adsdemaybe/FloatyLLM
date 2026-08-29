@@ -91,10 +91,12 @@ static void chat_repl(Tokenizer& tok, bool interactive, const std::string& promp
 // vLLM-style flags + an ollama-style interactive chat TUI (multi-turn, KV persists).
 // Works for BOTH MoE (hot-expert cache) and dense (streamed via the SlotPool ring).
 static int cmd_run(int argc, char** argv) {
-    std::string model, prompt; int n_pred = 256, ctx = 4096; float temp = 0.0f; double budget = 8.0; bool interactive = false;
+    std::string model, prompt; int n_pred = 256, ctx = 4096; float temp = 0.0f; double budget = 8.0;
+    bool interactive = false, stream_flag = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-it" || a == "--interactive") interactive = true;
+        else if (a == "--stream") stream_flag = true;   // stream a dense model from mmap (no host requant) -> huge models
         else if ((a == "-p" || a == "--prompt") && i+1 < argc) prompt = argv[++i];
         else if ((a == "-n" || a == "--n-predict") && i+1 < argc) n_pred = atoi(argv[++i]);
         else if (a == "--temp" && i+1 < argc) temp = (float)atof(argv[++i]);
@@ -111,13 +113,18 @@ static int cmd_run(int argc, char** argv) {
     Tokenizer tok;
     if (!tokenizer_load(model.c_str(), &tok, &err)) { printf("tokenizer: %s\n", err.c_str()); gguf_close(&g); return 1; }
 
-    if (is_moe_model(g)) {
+    // MoE always streams; dense streams from mmap only with --stream (else the host-requant
+    // path below). Streaming dense enables models far bigger than host RAM (e.g. 405B).
+    if (is_moe_model(g) || stream_flag) {
         LoadedMoeModel m;
         if (!load_moe_model(g, &m, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
         MoeSession S;
         if (!moe_session_init(m, ctx, budget, &S, &err)) { printf("session: %s\n", err.c_str()); return 1; }
-        printf("\n  FloatyLLM · %s · MoE %d/%d experts · %d layers · %.0f GB fp16 streamed from disk\n",
-               m.arch.c_str(), m.mcfg.n_used, m.mcfg.n_experts, m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
+        bool dense = m.mcfg.n_experts == 1;
+        if (dense) printf("\n  FloatyLLM · %s · dense (streamed from mmap) · %d layers · %.0f GB fp16 equiv\n",
+                          m.arch.c_str(), m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
+        else printf("\n  FloatyLLM · %s · MoE %d/%d experts · %d layers · %.0f GB fp16 streamed from disk\n",
+                    m.arch.c_str(), m.mcfg.n_used, m.mcfg.n_experts, m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
         printf("  ctx=%d  budget=%.0f GB  temp=%.2f%s\n", ctx, budget, temp,
                interactive ? "   (/bye to exit, /reset to clear context)" : "");
         auto eval = [&](const int* ids, int n) { return moe_session_eval(S, ids, n, &err); };
