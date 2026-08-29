@@ -5,7 +5,12 @@
 
 bool tokenizer_load(const char* path, Tokenizer* t, std::string* err) {
     static bool inited = false;
-    if (!inited) { llama_backend_init(); inited = true; }
+    if (!inited) {
+        // Silence llama.cpp's verbose loader unless SEMILLM_LLAMA_LOG is set.
+        if (!getenv("SEMILLM_LLAMA_LOG"))
+            llama_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
+        llama_backend_init(); inited = true;
+    }
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;      // load ONLY the vocab — no weights, no GPU alloc
     mp.n_gpu_layers = 0;
