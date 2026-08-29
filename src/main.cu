@@ -5,11 +5,30 @@
 #include "moe_model.h"
 #include "runner.h"
 #include "sampling.h"
+#include "tokenizer.h"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <string>
 #include <chrono>
+
+// `semillm tokenize <model.gguf> <text...>` — encode text to ids using the native SPM
+// tokenizer (verify vs `llama-tokenize --ids`). Also detokenizes back as a round-trip check.
+static int cmd_tokenize(int argc, char** argv) {
+    if (argc < 4) { printf("usage: %s tokenize <model.gguf> <text...>\n", argv[0]); return 2; }
+    Tokenizer tok; std::string err;
+    if (!tokenizer_load(argv[2], &tok, &err)) { printf("tokenizer_load: %s\n", err.c_str()); return 1; }
+    std::string text = argv[3];
+    for (int i = 4; i < argc; ++i) { text += " "; text += argv[i]; }
+    std::vector<int> ids = tokenizer_encode(tok, text);
+    printf("ids (%zu):", ids.size());
+    for (int id : ids) printf(" %d", id);
+    printf("\ndetok: '");
+    for (int id : ids) fputs(tokenizer_piece(tok, id).c_str(), stdout);
+    printf("'\n");
+    tokenizer_free(&tok);
+    return 0;
+}
 
 static void report_mem(const char* tag) {
     size_t freeb = 0, totalb = 0;
@@ -18,7 +37,9 @@ static void report_mem(const char* tag) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) { printf("usage: %s <model.gguf> <n_generate> <tok0> [tok1 ...]\n", argv[0]); return 2; }
+    if (argc >= 2 && std::string(argv[1]) == "tokenize") return cmd_tokenize(argc, argv);
+    if (argc < 4) { printf("usage: %s <model.gguf> <n_generate> <tok0> [tok1 ...]\n"
+                           "       %s tokenize <model.gguf> <text...>\n", argv[0], argv[0]); return 2; }
     int n_gen = atoi(argv[2]);
     std::vector<int> ids;
     for (int i = 3; i < argc; ++i) ids.push_back(atoi(argv[i]));
