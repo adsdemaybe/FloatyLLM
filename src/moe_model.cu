@@ -7,6 +7,7 @@
 #include "sampling.h"
 #include "gemm.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -30,6 +31,19 @@ void block_info(uint32_t type, size_t* be, size_t* bb) {
 }
 
 std::string mk(const std::string& a, const char* s) { return a + "." + s; }
+
+// SentencePiece detokenize of one token piece: U+2581 (▁) -> space, <0xAB> -> raw byte.
+std::string sp_piece(const std::string& t) {
+    if (t.size() == 6 && t[0] == '<' && t[1] == '0' && t[2] == 'x' && t[5] == '>')
+        return std::string(1, (char)strtol(t.c_str() + 3, nullptr, 16));
+    std::string o; o.reserve(t.size());
+    for (size_t i = 0; i < t.size();) {
+        if ((unsigned char)t[i] == 0xE2 && i + 2 < t.size() &&
+            (unsigned char)t[i+1] == 0x96 && (unsigned char)t[i+2] == 0x81) { o.push_back(' '); i += 3; }
+        else { o.push_back(t[i]); ++i; }
+    }
+    return o;
+}
 
 bool read_moe_config(const GgufFile& g, LoadedMoeModel* out, std::string* err) {
     if (!gguf_get_str(g, "general.architecture", &out->arch)) { if (err) *err = "no arch"; return false; }
@@ -249,15 +263,28 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
         return sample_greedy(lf.data(), m.vocab);
     };
 
+    // Live token streaming (SEMILLM_STREAM=1): detokenize + print each token as generated.
+    const std::vector<std::string>* toks = nullptr;
+    auto tit = m.g->meta.find("tokenizer.ggml.tokens");
+    if (tit != m.g->meta.end() && !tit->second.strs.empty()) toks = &tit->second.strs;
+    bool stream_out = getenv("SEMILLM_STREAM") != nullptr;
+    if (stream_out && !toks) printf("(SEMILLM_STREAM set but no tokenizer.ggml.tokens in GGUF)\n");
+    auto emit = [&](int id) {
+        if (!stream_out || !toks || id < 0 || id >= (int)toks->size()) return;
+        std::string p = sp_piece((*toks)[id]); fputs(p.c_str(), stdout); fflush(stdout);
+    };
+
     printf("prefill %d + generate %d (MoE, stream-original)...\n", prompt_len, n_gen);
+    if (stream_out) { fputs("> ", stdout); for (int id : ids) emit(id); }
     cudaMemcpy(d_ids, ids.data(), prompt_len*4, cudaMemcpyHostToDevice);
     forward(d_ids, prompt_len, 0); kv.len = prompt_len;
-    int next = sample(); ids.push_back(next);
+    int next = sample(); ids.push_back(next); emit(next);
     auto t0 = std::chrono::steady_clock::now();
     for (int step=1; step<n_gen; ++step) {
         cudaMemcpy(d_ids, &next, 4, cudaMemcpyHostToDevice);
-        forward(d_ids, 1, kv.len); kv.len += 1; next = sample(); ids.push_back(next);
+        forward(d_ids, 1, kv.len); kv.len += 1; next = sample(); ids.push_back(next); emit(next);
     }
+    if (stream_out) fputc('\n', stdout);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { if (err) *err = cudaGetErrorString(e); return false; }

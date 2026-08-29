@@ -7,7 +7,7 @@
 #include <vector>
 #include <unordered_map>
 
-// GGUF metadata value types (subset we store; arrays are parsed but not retained).
+// GGUF metadata value types (subset we store; string arrays retained, numeric arrays skipped).
 enum GgufValueType {
     GGUF_U8 = 0, GGUF_I8 = 1, GGUF_U16 = 2, GGUF_I16 = 3, GGUF_U32 = 4,
     GGUF_I32 = 5, GGUF_F32 = 6, GGUF_BOOL = 7, GGUF_STRING = 8, GGUF_ARRAY = 9,
@@ -23,6 +23,7 @@ struct MetaValue {
     int64_t inum = 0;    // for integer/bool types
     double fnum = 0.0;   // for float types
     std::string str;     // for string type
+    std::vector<std::string> strs;   // for string arrays (e.g. tokenizer.ggml.tokens)
 };
 
 struct TensorInfo {
