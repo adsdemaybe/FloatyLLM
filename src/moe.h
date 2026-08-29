@@ -63,6 +63,18 @@ void moe_experts_out(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLay
                      __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
                      cudaStream_t stream, const int* active, int n_active);
 
+// Primitives for overlapped (copy/compute) expert streaming: zero the accumulator once,
+// run ONE expert's SwiGLU into it (after that expert's weights are streamed), then the
+// tail (shared expert + residual). Lets the caller interleave streaming and compute.
+void moe_mlp_zero(__half* out, int n, cudaStream_t stream);
+void moe_mlp_one(Gemm* g, const __half* x, const __half* wgate_e, const __half* wup_e,
+                 const __half* wdown_e, const float* route_w, __half* out, __half* gate,
+                 __half* up, __half* ye, int T, int dim, int ffn, int e, int n_experts,
+                 cudaStream_t stream);
+void moe_experts_tail(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                      __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
+                      cudaStream_t stream);
+
 // Cached MoE decoder layer (all experts resident): attention (KV cache) + router + experts.
 void moe_layer_forward_cached(const LlamaConfig& cfg, const MoeConfig& mcfg,
                               const MoeLayerWeights& w, __half* hidden, const int* d_positions,

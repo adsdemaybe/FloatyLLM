@@ -197,18 +197,22 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
     w.wgate=wg.data(); w.wup=wu.data(); w.wdown=wd.data();
 
     int* d_ids; cudaMalloc(&d_ids, max_T*4);
-    cudaStream_t cm; cudaStreamCreate(&cm);
+    // cm = compute stream, cs = copy stream. Expert weights prefetch on cs while cm
+    // computes the previous expert; a per-expert event orders each compute after its copy.
+    cudaStream_t cm, cs; cudaStreamCreate(&cm); cudaStreamCreate(&cs);
+    std::vector<cudaEvent_t> ev(E);
+    for (int e=0;e<E;++e) cudaEventCreateWithFlags(&ev[e], cudaEventDisableTiming);
     Gemm gemm; gemm_create(&gemm);
     std::vector<__half> hl(m.vocab); std::vector<float> lf(m.vocab);
 
-    auto stream_mat = [&](const MatRef& mr) {
-        cudaMemcpyAsync(d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, cm);
-        if (mr.is_norm) dequant_to_fp16(d_qstage, arena + mr.arena_off, mr.type, mr.n_elems, cm);
-        else { dequant_to_fp16(d_qstage, d_deq, mr.type, mr.n_elems, cm);
-               transpose_fp16(d_deq, arena + mr.arena_off, mr.out, mr.in, cm); }
+    auto stream_mat = [&](const MatRef& mr, cudaStream_t st) {
+        cudaMemcpyAsync(d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, st);
+        if (mr.is_norm) dequant_to_fp16(d_qstage, arena + mr.arena_off, mr.type, mr.n_elems, st);
+        else { dequant_to_fp16(d_qstage, d_deq, mr.type, mr.n_elems, st);
+               transpose_fp16(d_deq, arena + mr.arena_off, mr.out, mr.in, st); }
     };
-    // Active-expert streaming (PLAN sec 16): stream attn + router, route, then stream
-    // ONLY the experts the router selected (n_used per token, not all n_experts).
+    // Active-expert streaming (PLAN sec 16) + copy/compute overlap: stream attn + router,
+    // route, then prefetch ONLY the selected experts on cs while cm computes them.
     long exp_streamed = 0, exp_total = 0;
     auto forward = [&](const int* d_tok, int n_new, int len_before) {
         std::vector<int> pos(n_new); for (int i=0;i<n_new;++i) pos[i]=len_before+i;
@@ -216,11 +220,23 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
         embed_tokens(m.rw.token_embd, d_tok, hidden, n_new, dim, cm);
         int active[256];
         for (int L=0; L<m.n_layers; ++L) {
-            for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) stream_mat(mr);   // attn + router
+            for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) stream_mat(mr, cm);   // attn + router (on cm; router syncs)
             int na = moe_attn_route(cfg, mc, w, hidden, positions, n_new, L, len_before, kv, s, ms, &gemm, cm, active, 256);
-            for (int a=0; a<na; ++a)
-                for (const MatRef& mr : m.layers[L]) if (mr.expert == active[a]) stream_mat(mr);   // active experts only
-            moe_experts_out(cfg, mc, w, hidden, n_new, s, ms, &gemm, cm, active, na);
+            moe_mlp_zero(ms.moe_out, n_new*dim, cm);
+            // Prefetch each active expert on cs (staging buffers are free: the router sync
+            // drained cm's attn streaming). Each records an event when its arena slot is ready.
+            for (int a=0; a<na; ++a) {
+                for (const MatRef& mr : m.layers[L]) if (mr.expert == active[a]) stream_mat(mr, cs);
+                cudaEventRecord(ev[a], cs);
+            }
+            // Compute expert a on cm after its copy completes; cs streams a+1.. concurrently.
+            // Waiting ev[na-1] also hands the shared staging buffers back to cm for next layer.
+            for (int a=0; a<na; ++a) {
+                cudaStreamWaitEvent(cm, ev[a], 0);
+                moe_mlp_one(&gemm, s.xn, wg[active[a]], wu[active[a]], wd[active[a]], ms.route_w,
+                            ms.moe_out, ms.gate, ms.up, ms.ye, n_new, dim, ef, active[a], E, cm);
+            }
+            moe_experts_tail(cfg, mc, w, hidden, n_new, s, ms, &gemm, cm);
             exp_streamed += na; exp_total += E;
         }
         rmsnorm(hidden, m.rw.final_norm, normed, n_new, dim, cfg.eps, cm);
@@ -250,6 +266,8 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
         printf("active-expert streaming: %ld / %ld expert-loads (%.1f%% of dense), %d/%d used/layer\n",
                exp_streamed, exp_total, 100.0 * exp_streamed / exp_total, mc.n_used, E);
 
+    for (int e=0;e<E;++e) cudaEventDestroy(ev[e]);
+    cudaStreamDestroy(cs);
     cudaFree(kv.K); cudaFree(kv.V); gemm_destroy(&gemm); free_moe_model(&m);
     return true;
 }
