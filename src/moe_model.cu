@@ -23,6 +23,7 @@ void block_info(uint32_t type, size_t* be, size_t* bb) {
         case GGML_Q4_0: *be = 32;  *bb = 18;  break;
         case GGML_Q5_0: *be = 32;  *bb = 22;  break;
         case GGML_Q4_K: *be = 256; *bb = 144; break;
+        case GGML_Q5_K: *be = 256; *bb = 176; break;
         case GGML_Q6_K: *be = 256; *bb = 210; break;
         default:        *be = 0;   *bb = 0;   break;
     }

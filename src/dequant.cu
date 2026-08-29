@@ -55,6 +55,26 @@ __global__ void dequant_q4_K_kernel(const BlockQ4K* blocks, __half* y, int nb) {
     }
 }
 
+// Q5_K: like Q4_K but a 5th bit per weight from qh. Unsigned 5-bit (0..31),
+// per-64 sub-block scale/min via get_scale_min_k4. See llama.cpp dequantize_row_q5_K.
+__global__ void dequant_q5_K_kernel(const BlockQ5K* blocks, __half* y, int nb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    const BlockQ5K& b = blocks[i];
+    float d = __half2float(b.d), mn = __half2float(b.dmin);
+    const uint8_t* ql = b.qs;
+    const uint8_t* qh = b.qh;
+    __half* yy = y + (size_t)i * 256;
+    int is = 0, yi = 0; uint8_t sc, m; uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        get_scale_min_k4(is + 0, b.scales, &sc, &m); float d1 = d * sc, m1 = mn * m;
+        get_scale_min_k4(is + 1, b.scales, &sc, &m); float d2 = d * sc, m2 = mn * m;
+        for (int l = 0; l < 32; ++l) yy[yi++] = __float2half(d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1);
+        for (int l = 0; l < 32; ++l) yy[yi++] = __float2half(d2 * (float)((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2);
+        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+    }
+}
+
 __global__ void dequant_q6_K_kernel(const BlockQ6K* blocks, __half* y, int nb) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nb) return;
@@ -83,6 +103,12 @@ void dequant_q4_K(const BlockQ4K* d_blocks, __half* d_out, int n_blocks, cudaStr
     if (n_blocks <= 0) return;
     int t = 128;
     dequant_q4_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
+}
+
+void dequant_q5_K(const BlockQ5K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    int t = 128;
+    dequant_q5_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
 }
 
 void dequant_q6_K(const BlockQ6K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream) {
@@ -119,6 +145,7 @@ void dequant_to_fp16(const uint8_t* q, __half* out, uint32_t type, size_t n, cud
         case 2:  dequant_q4_0((const BlockQ40*)q, out, (int)(n / 32), stream); break;   // Q4_0
         case 8:  dequant_q8_0((const BlockQ80*)q, out, (int)(n / 32), stream); break;   // Q8_0
         case 12: dequant_q4_K((const BlockQ4K*)q, out, (int)(n / 256), stream); break;  // Q4_K
+        case 13: dequant_q5_K((const BlockQ5K*)q, out, (int)(n / 256), stream); break;  // Q5_K
         case 14: dequant_q6_K((const BlockQ6K*)q, out, (int)(n / 256), stream); break;  // Q6_K
         default: break;
     }

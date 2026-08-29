@@ -212,6 +212,7 @@ uint64_t gguf_tensor_bytes(const TensorInfo& t) {
         case GGML_Q4_0: return (n / 32) * 18;
         case GGML_Q5_0: return (n / 32) * 22;
         case GGML_Q4_K: return (n / 256) * 144;
+        case GGML_Q5_K: return (n / 256) * 176;
         case GGML_Q6_K: return (n / 256) * 210;
         default: return 0;
     }
