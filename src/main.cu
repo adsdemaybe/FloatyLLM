@@ -56,7 +56,10 @@ static void chat_repl(Tokenizer& tok, bool interactive, const std::string& promp
         std::string delta = fmt.size() >= prev_fmt.size() ? fmt.substr(prev_fmt.size()) : fmt;
         std::vector<int> ids = tokenizer_encode(tok, delta, evald == 0);
         if (ids.empty()) { printf("[empty prompt]\n"); return; }
+        auto tp = std::chrono::steady_clock::now();
         if (!eval(ids.data(), (int)ids.size())) { printf("[eval error]\n"); return; }
+        double pf = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
+        printf("\033[2m[prefill %d tok in %.2fs, %.1f tok/s]\033[0m\n", (int)ids.size(), pf, ids.size() / (pf > 0 ? pf : 1));
         evald += (int)ids.size();
         std::string reply; auto t0 = std::chrono::steady_clock::now(); int steps = 0;
         for (; steps < n_pred; ++steps) {

@@ -324,12 +324,14 @@ static bool dense_decode_supported(LoadedMoeModel& m) {
     return true;
 }
 
-// Fused dense-decode of one Llama layer for a single token: compute straight from the
-// mmap'd quantized weights via fused dequant-GEMV. No H2D staging, no fp16 dequant
-// arena, no transpose, no expert cache -- GB10 unified memory lets the GEMV read the
-// host mmap pointer (mr.src) directly (pageableMemoryAccess). Collapses the dequant +
-// transpose cost that dominates decode. Returns false only on a structural mismatch.
-static bool dense_decode_layer(MoeSession& S, int L, int len_before, cudaStream_t st) {
+// Fused dense layer for n_new tokens: compute straight from the mmap'd quantized weights
+// via fused dequant-GEMV. No H2D staging, no fp16 dequant arena, no transpose, no expert
+// cache -- GB10 unified memory lets the GEMV read the host mmap pointer (mr.src) directly
+// (pageableMemoryAccess). Collapses the dequant + transpose cost. Used for decode (n_new=1)
+// and short prefills (fused GEMV re-reads W per token, so only worthwhile for small n_new;
+// long prompts keep the dequant-once + cuBLAS-GEMM path). Returns false on a structural
+// mismatch.
+static bool dense_decode_layer(MoeSession& S, int L, int len_before, int n_new, cudaStream_t st) {
     LoadedMoeModel& m = *S.m; const LlamaConfig& cfg = m.cfg;
     int dim = cfg.dim, qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ef = m.mcfg.expert_ffn;
     float scale = 1.0f / sqrtf((float)cfg.head_dim);
@@ -364,24 +366,24 @@ static bool dense_decode_layer(MoeSession& S, int L, int len_before, cudaStream_
     __half* Kdst = Kbase + (size_t)len_before * kvd;
     __half* Vdst = Vbase + (size_t)len_before * kvd;
 
-    rmsnorm(S.hidden, an_w, S.s.xn, 1, dim, cfg.eps, st);
-    fused_gemv(wq.src, S.s.xn, S.s.q, 1, qd, dim, wq.mr->type, st);
-    fused_gemv(wk.src, S.s.xn, Kdst, 1, kvd, dim, wk.mr->type, st);
-    fused_gemv(wv.src, S.s.xn, Vdst, 1, kvd, dim, wv.mr->type, st);
-    rope_inplace(S.s.q, S.positions, 1, cfg.n_heads, cfg.head_dim, cfg.rope_base, st);
-    rope_inplace(Kdst, S.positions, 1, cfg.n_kv_heads, cfg.head_dim, cfg.rope_base, st);
-    attention_cached(S.s.q, Kbase, Vbase, S.s.att, 1, len_before,
+    rmsnorm(S.hidden, an_w, S.s.xn, n_new, dim, cfg.eps, st);
+    fused_gemv(wq.src, S.s.xn, S.s.q, n_new, qd, dim, wq.mr->type, st);
+    fused_gemv(wk.src, S.s.xn, Kdst, n_new, kvd, dim, wk.mr->type, st);
+    fused_gemv(wv.src, S.s.xn, Vdst, n_new, kvd, dim, wv.mr->type, st);
+    rope_inplace(S.s.q, S.positions, n_new, cfg.n_heads, cfg.head_dim, cfg.rope_base, st);
+    rope_inplace(Kdst, S.positions, n_new, cfg.n_kv_heads, cfg.head_dim, cfg.rope_base, st);
+    attention_cached(S.s.q, Kbase, Vbase, S.s.att, n_new, len_before,
                      cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, st);
-    fused_gemv(wo.src, S.s.att, S.s.proj, 1, dim, qd, wo.mr->type, st);
-    residual_add(S.hidden, S.s.proj, dim, st);
+    fused_gemv(wo.src, S.s.att, S.s.proj, n_new, dim, qd, wo.mr->type, st);
+    residual_add(S.hidden, S.s.proj, n_new * dim, st);
 
-    rmsnorm(S.hidden, fn_w, S.s.xn, 1, dim, cfg.eps, st);
-    fused_gemv(wg.src, S.s.xn, S.ms.gate, 1, ef, dim, wg.mr->type, st);
-    fused_gemv(wu.src, S.s.xn, S.ms.up, 1, ef, dim, wu.mr->type, st);
-    silu(S.ms.gate, S.ms.gate, ef, st);
-    elementwise_mul(S.ms.gate, S.ms.up, S.ms.gate, ef, st);
-    fused_gemv(wd.src, S.ms.gate, S.ms.ye, 1, dim, ef, wd.mr->type, st);
-    residual_add(S.hidden, S.ms.ye, dim, st);
+    rmsnorm(S.hidden, fn_w, S.s.xn, n_new, dim, cfg.eps, st);
+    fused_gemv(wg.src, S.s.xn, S.ms.gate, n_new, ef, dim, wg.mr->type, st);
+    fused_gemv(wu.src, S.s.xn, S.ms.up, n_new, ef, dim, wu.mr->type, st);
+    silu(S.ms.gate, S.ms.gate, n_new * ef, st);
+    elementwise_mul(S.ms.gate, S.ms.up, S.ms.gate, n_new * ef, st);
+    fused_gemv(wd.src, S.ms.gate, S.ms.ye, n_new, dim, ef, wd.mr->type, st);
+    residual_add(S.hidden, S.ms.ye, n_new * dim, st);
     return true;
 }
 
@@ -395,13 +397,16 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
     cudaMemcpy(S.positions, pos.data(), n_new*4, cudaMemcpyHostToDevice);
     embed_tokens(m.rw.token_embd, S.d_ids, S.hidden, n_new, dim, S.cm);
     ExpertCache& c = S.cache;
-    // Dense-decode fast path: single token, one-expert model, all weights fused-GEMV
-    // capable -> compute each layer straight from mmap quant (no dequant arena/transpose/
-    // cache). Kills the ~95% dequant+transpose decode cost on GB10 unified memory.
-    bool dense_decode = (E == 1 && n_new == 1 && dense_decode_supported(m));
+    // Dense fused path: one-expert model, all weights fused-GEMV capable -> compute each
+    // layer straight from mmap quant (no dequant arena/transpose/cache). Used for decode
+    // and prefills up to a crossover: the fused GEMV re-reads W per token (~cost n_new x
+    // one decode), while the old dequant+transpose+cuBLAS pass is a fixed ~1 model pass.
+    // Measured crossover on 70B q4km is ~170 tokens; use 160 so typical prompts get the
+    // fused path (avoids the ~55s naive-transpose prefill), long prompts keep GEMM.
+    bool dense_fused = (E == 1 && n_new <= 160 && dense_decode_supported(m));
     int active[256]; bool miss[256]; int slot_of[256];
     for (int L=0; L<m.n_layers; ++L) {
-        if (dense_decode) { dense_decode_layer(S, L, len_before, S.cm); continue; }
+        if (dense_fused) { dense_decode_layer(S, L, len_before, n_new, S.cm); continue; }
         for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) session_stream_mat(S, mr, S.cm);   // attn + router
         int na = moe_attn_route(cfg, mc, S.w, S.hidden, S.positions, n_new, L, len_before, S.kv, S.s, S.ms, &S.gemm, S.cm, active, 256);
         moe_mlp_zero(S.ms.moe_out, n_new*dim, S.cm);
