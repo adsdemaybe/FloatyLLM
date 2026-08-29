@@ -63,6 +63,42 @@ __device__ __forceinline__ void unpack_q3_scales(const uint8_t* s, int8_t* sc) {
     for (int i = 0; i < 16; ++i) sc[i] = p[i];
 }
 
+// Q2_K: scales[16], qs[64], __half d, dmin. 84 B / 256. Warp per (row, token); lane l
+// handles element l of each 32-slice (h in {0,1}, j in 0..3 -> 8 values/lane), coalesced.
+// value = d*(scale nibble)*q2 - dmin*(min nibble).
+__global__ void gemv_q2_K_kernel(const uint8_t* W, const __half* x, __half* y,
+                                 int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1);
+    int o = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    int tok = blockIdx.y;
+    if (o >= n_out || tok >= m) return;
+    int nsb = n_in / 256;
+    const uint8_t* wrow = W + (size_t)o * nsb * 84;
+    const __half* xt = x + (size_t)tok * n_in;
+    float acc = 0.0f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* blk = wrow + (size_t)sb * 84;
+        const uint8_t* scales = blk;
+        const uint8_t* qs = blk + 16;
+        float d = __half2float(*(const __half*)(blk + 80));
+        float dmin = __half2float(*(const __half*)(blk + 82));
+        const __half* xb = xt + (size_t)sb * 256;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint8_t qb = qs[h * 32 + lane];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = scales[h * 8 + j * 2 + (lane >= 16 ? 1 : 0)];
+                float dl = d * (float)(sc & 0xF), ml = dmin * (float)(sc >> 4);
+                int q2 = (qb >> (2 * j)) & 3;
+                acc += (dl * (float)q2 - ml) * __half2float(xb[h * 128 + j * 32 + lane]);
+            }
+        }
+    }
+    acc = warp_reduce(acc);
+    if (lane == 0) y[(size_t)tok * n_out + o] = __float2half(acc);
+}
+
 // Q3_K: hmask[32], qs[64], scales[12], __half d. 110 B / 256. Warp per (row, token);
 // lane l handles element l of each 32-slice (h in {0,1}, j in 0..3 -> 8 values/lane),
 // coalesced. value = d*(scale-32)*((qs 2 bits) - (hmask bit ? 0 : 4)).
@@ -233,6 +269,12 @@ void fused_gemv_q4_K(const uint8_t* W, const __half* x, __half* y, int m, int n_
     gemv_q4_K_kernel<<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in);
 }
 
+void fused_gemv_q2_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream) {
+    if (m <= 0 || n_out <= 0 || n_in <= 0) return;
+    dim3 grid((n_out + WARPS - 1) / WARPS, m);
+    gemv_q2_K_kernel<<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in);
+}
+
 void fused_gemv_q3_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream) {
     if (m <= 0 || n_out <= 0 || n_in <= 0) return;
     dim3 grid((n_out + WARPS - 1) / WARPS, m);
@@ -255,6 +297,7 @@ bool fused_gemv(const uint8_t* W, const __half* x, __half* y, int m, int n_out, 
                 uint32_t ggml_type, cudaStream_t stream) {
     switch (ggml_type) {
         case 8:  fused_gemv_q8_0(W, x, y, m, n_out, n_in, stream); return true;   // Q8_0
+        case 10: fused_gemv_q2_K(W, x, y, m, n_out, n_in, stream); return true;   // Q2_K
         case 11: fused_gemv_q3_K(W, x, y, m, n_out, n_in, stream); return true;   // Q3_K
         case 12: fused_gemv_q4_K(W, x, y, m, n_out, n_in, stream); return true;   // Q4_K
         case 13: fused_gemv_q5_K(W, x, y, m, n_out, n_in, stream); return true;   // Q5_K
