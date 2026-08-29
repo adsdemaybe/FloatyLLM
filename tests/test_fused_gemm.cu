@@ -25,6 +25,7 @@ static int run(const char* name, uint32_t type, int block_bytes, int block_elems
         __half* d = (__half*)blk;
         float dv = 0.05f * (((o + b) % 7) + 1);
         if (type == 14) *(__half*)(blk + 208) = __float2half(dv * 0.05f);       // Q6_K d at offset 208 (int8 scales)
+        else if (type == 10) { *(__half*)(blk + 80) = __float2half(dv * 0.05f); *(__half*)(blk + 82) = __float2half(dv * 0.02f); }  // Q2_K d,dmin
         else if (type == 11) *(__half*)(blk + 108) = __float2half(dv * 0.05f);  // Q3_K d at offset 108
         else { d[0] = __float2half(dv);
                if (type == 12 || type == 13) d[1] = __float2half(0.03f * ((b % 5) + 1)); }  // Q4_K/Q5_K dmin
@@ -78,6 +79,18 @@ static void ref_q4_K(const uint8_t* blk, int b, float* row) {
     }
 }
 
+static void ref_q2_K(const uint8_t* blk, int b, float* row) {
+    const uint8_t* scales = blk; const uint8_t* qs = blk + 16;
+    float d = __half2float(*(const __half*)(blk + 80)), dmin = __half2float(*(const __half*)(blk + 82));
+    for (int h = 0; h < 2; ++h)
+        for (int j = 0; j < 4; ++j)
+            for (int r = 0; r < 32; ++r) {
+                int qidx = h * 32 + r; uint8_t sc = scales[h * 8 + j * 2 + (r >= 16 ? 1 : 0)];
+                float dl = d * (float)(sc & 0xF), ml = dmin * (float)(sc >> 4);
+                int q2 = (qs[qidx] >> (2 * j)) & 3;
+                row[b * 256 + h * 128 + j * 32 + r] = dl * (float)q2 - ml;
+            }
+}
 static void unpack_q3_scales_host(const uint8_t* s, int8_t* sc) {
     uint32_t a0 = s[0]|(s[1]<<8)|(s[2]<<16)|((uint32_t)s[3]<<24);
     uint32_t a1 = s[4]|(s[5]<<8)|(s[6]<<16)|((uint32_t)s[7]<<24);
@@ -176,6 +189,7 @@ int main(int argc, char** argv) {
     srand(123);
     if (argc > 1 && std::string(argv[1]) == "bench") {
         bench("Q8_0", 8, 34, 32);
+        bench("Q2_K", 10, 84, 256);
         bench("Q3_K", 11, 110, 256);
         bench("Q4_K", 12, 144, 256);
         bench("Q5_K", 13, 176, 256);
@@ -184,6 +198,7 @@ int main(int argc, char** argv) {
     }
     int rc = 0;
     rc |= run("fused_gemv Q8_0", 8, 34, 32, ref_q8_0);
+    rc |= run("fused_gemv Q2_K", 10, 84, 256, ref_q2_K);
     rc |= run("fused_gemv Q3_K", 11, 110, 256, ref_q3_K);
     rc |= run("fused_gemv Q4_K", 12, 144, 256, ref_q4_K);
     rc |= run("fused_gemv Q5_K", 13, 176, 256, ref_q5_K);

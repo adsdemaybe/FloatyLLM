@@ -134,6 +134,31 @@ __device__ __forceinline__ void unpack_q3_scales(const uint8_t* s, int8_t* sc) {
     for (int i = 0; i < 16; ++i) sc[i] = p[i];
 }
 
+// Q2_K: 2-bit weights, per-16 sub-block 4-bit scale (low nibble) + 4-bit min (high nibble).
+// value(pos) = d*(scale) * q2 - dmin*(min). See llama.cpp dequantize_row_q2_K.
+__global__ void dequant_q2_K_kernel(const BlockQ2K* blocks, __half* y, int nb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    const BlockQ2K& b = blocks[i];
+    float d = __half2float(b.d), dmin = __half2float(b.dmin);
+    __half* yy = y + (size_t)i * 256;
+    for (int h = 0; h < 2; ++h)
+        for (int j = 0; j < 4; ++j)
+            for (int r = 0; r < 32; ++r) {
+                int qidx = h * 32 + r, sidx = h * 8 + j * 2 + (r >= 16 ? 1 : 0);
+                uint8_t sc = b.scales[sidx];
+                float dl = d * (sc & 0xF), ml = dmin * (sc >> 4);
+                int q2 = (b.qs[qidx] >> (2 * j)) & 3;
+                yy[h * 128 + j * 32 + r] = __float2half(dl * (float)q2 - ml);
+            }
+}
+
+void dequant_q2_K(const BlockQ2K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    int t = 128;
+    dequant_q2_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
+}
+
 // Q3_K: 3-bit weights (2 bits in qs, 3rd bit in hmask), 16 6-bit sub-block scales.
 // value(pos) = d * (scale-32) * ((qs bits) - (hmask bit ? 0 : 4)). See llama.cpp
 // dequantize_row_q3_K. One thread per 256-value super-block.
@@ -190,6 +215,7 @@ void dequant_to_fp16(const uint8_t* q, __half* out, uint32_t type, size_t n, cud
             cudaMemcpyAsync(out, q, n * sizeof(__half), cudaMemcpyDeviceToDevice, stream); break;
         case 2:  dequant_q4_0((const BlockQ40*)q, out, (int)(n / 32), stream); break;   // Q4_0
         case 8:  dequant_q8_0((const BlockQ80*)q, out, (int)(n / 32), stream); break;   // Q8_0
+        case 10: dequant_q2_K((const BlockQ2K*)q, out, (int)(n / 256), stream); break;  // Q2_K
         case 11: dequant_q3_K((const BlockQ3K*)q, out, (int)(n / 256), stream); break;  // Q3_K
         case 12: dequant_q4_K((const BlockQ4K*)q, out, (int)(n / 256), stream); break;  // Q4_K
         case 13: dequant_q5_K((const BlockQ5K*)q, out, (int)(n / 256), stream); break;  // Q5_K
