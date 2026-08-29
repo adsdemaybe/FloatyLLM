@@ -19,8 +19,24 @@ add_library(semillm_core STATIC ${CORE_SRC})
 target_include_directories(semillm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(semillm_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt Threads::Threads)
 
+# Optional: use llama.cpp's vocab (libllama) for tokenization. Point this at a built
+# llama.cpp checkout (has include/llama.h and build/bin/libllama.so). Without it, the
+# project still builds but the tokenizer/chat commands are disabled.
+set(SEMILLM_LLAMA_DIR "" CACHE PATH "Path to a built llama.cpp (include/ + build/bin/libllama.so)")
+if(SEMILLM_LLAMA_DIR)
+  find_library(LLAMA_LIB llama PATHS ${SEMILLM_LLAMA_DIR}/build/bin REQUIRED)
+  target_include_directories(semillm_core PUBLIC ${SEMILLM_LLAMA_DIR}/include ${SEMILLM_LLAMA_DIR}/ggml/include)
+  target_link_libraries(semillm_core PUBLIC ${LLAMA_LIB})
+  target_compile_definitions(semillm_core PUBLIC SEMILLM_HAVE_LLAMA=1)
+  set(SEMILLM_LLAMA_RPATH ${SEMILLM_LLAMA_DIR}/build/bin)
+  message(STATUS "SemiLLM: tokenizer via llama.cpp at ${SEMILLM_LLAMA_DIR}")
+endif()
+
 add_executable(semillm src/main.cu)
 target_link_libraries(semillm PRIVATE semillm_core)
+if(SEMILLM_LLAMA_DIR)
+  set_target_properties(semillm PROPERTIES BUILD_RPATH ${SEMILLM_LLAMA_RPATH} INSTALL_RPATH ${SEMILLM_LLAMA_RPATH})
+endif()
 
 enable_testing()
 add_executable(test_dequant tests/test_dequant.cu)
