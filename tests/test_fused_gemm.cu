@@ -111,7 +111,7 @@ static void ref_q6_K(const uint8_t* blk, int b, float* row) {
 // Time a decode-shape GEMV (m=1) and report latency + achieved weight bandwidth. GEMV is
 // bandwidth-bound, so GB/s near the device peak means the kernel is close to optimal.
 static void bench(const char* name, uint32_t type, int block_bytes, int block_elems) {
-    int n_in = 4096, n_out = 4096, m = 1, nb = n_in / block_elems;
+    int n_in = 8192, n_out = 28672, m = 1, nb = n_in / block_elems;  // FFN-size, exceeds L2 -> true DRAM BW
     size_t wbytes = (size_t)n_out * nb * block_bytes;
     std::vector<uint8_t> W(wbytes); for (auto& b : W) b = rand() & 0xFF;
     std::vector<__half> x((size_t)m * n_in, __float2half(0.01f));
@@ -127,10 +127,22 @@ static void bench(const char* name, uint32_t type, int block_bytes, int block_el
     for (int i = 0; i < iters; ++i) fused_gemv(dW, dx, dy, m, n_out, n_in, type, 0);
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b);
-    double us = ms * 1000.0 / iters;
-    double gbps = wbytes / (us * 1e-6) / 1e9;
-    printf("%s [%dx%d m=%d]: %.1f us/call, %.0f GB/s (weights)\n", name, n_out, n_in, m, us, gbps);
-    cudaFree(dW); cudaFree(dx); cudaFree(dy);
+    double us = ms * 1000.0 / iters, gbps = wbytes / (us * 1e-6) / 1e9;
+    printf("%s [%dx%d m=%d] DEVICE: %.1f us/call, %.0f GB/s\n", name, n_out, n_in, m, us, gbps);
+    cudaFree(dW);
+    // Host-pointer variant: weights read straight from host malloc (GB10 pageableMemoryAccess),
+    // mimicking the mmap decode path -- compares the coherence-path BW vs GPU-local DRAM.
+    uint8_t* hW = (uint8_t*)malloc(wbytes);
+    for (size_t i = 0; i < wbytes; ++i) hW[i] = rand() & 0xFF;
+    for (int i = 0; i < 10; ++i) fused_gemv(hW, dx, dy, m, n_out, n_in, type, 0);
+    cudaDeviceSynchronize();
+    cudaEventRecord(a);
+    for (int i = 0; i < iters; ++i) fused_gemv(hW, dx, dy, m, n_out, n_in, type, 0);
+    cudaEventRecord(b); cudaEventSynchronize(b);
+    float ms2 = 0; cudaEventElapsedTime(&ms2, a, b);
+    double us2 = ms2 * 1000.0 / iters, gbps2 = wbytes / (us2 * 1e-6) / 1e9;
+    printf("%s [%dx%d m=%d] HOST:   %.1f us/call, %.0f GB/s\n", name, n_out, n_in, m, us2, gbps2);
+    free(hW); cudaFree(dx); cudaFree(dy);
 }
 
 int main(int argc, char** argv) {
