@@ -13,6 +13,7 @@
 #include <chrono>
 #include <iostream>
 #include <utility>
+#include <functional>
 
 // `semillm tokenize <model.gguf> <text...>` — encode text to ids using the native SPM
 // tokenizer (verify vs `llama-tokenize --ids`). Also detokenizes back as a round-trip check.
@@ -38,8 +39,57 @@ static void report_mem(const char* tag) {
     printf("[mem] %-13s free=%.2f GB / total=%.2f GB\n", tag, freeb / 1e9, totalb / 1e9);
 }
 
-// `semillm run <model.gguf> [-p TEXT | -it] [-n N] [--temp T] [--budget GB] [--ctx N]`
+// Shared chat loop for the TUI. Renders each user turn with the model's chat template,
+// feeds only the new delta (KV persists), and streams the detokenized reply until EOG or
+// n_pred. eval(ids,n) runs the forward + updates logits; sample() returns the next id;
+// reset() clears the model KV. add_special (BOS) is added only on the first eval.
+static void chat_repl(Tokenizer& tok, bool interactive, const std::string& prompt, int n_pred,
+                      const std::function<bool(const int*, int)>& eval,
+                      const std::function<int()>& sample,
+                      const std::function<void()>& reset) {
+    std::vector<std::pair<std::string, std::string>> msgs;
+    std::string prev_fmt; int evald = 0; srand(1234);
+    auto run_turn = [&](const std::string& user) {
+        msgs.push_back({"user", user});
+        std::string fmt = tokenizer_apply_chat(tok, msgs, true);
+        if (fmt.empty()) fmt = prev_fmt + user;              // no chat template: raw text
+        std::string delta = fmt.size() >= prev_fmt.size() ? fmt.substr(prev_fmt.size()) : fmt;
+        std::vector<int> ids = tokenizer_encode(tok, delta, evald == 0);
+        if (ids.empty()) { printf("[empty prompt]\n"); return; }
+        if (!eval(ids.data(), (int)ids.size())) { printf("[eval error]\n"); return; }
+        evald += (int)ids.size();
+        std::string reply; auto t0 = std::chrono::steady_clock::now(); int steps = 0;
+        for (; steps < n_pred; ++steps) {
+            int next = sample();
+            if (tokenizer_is_eog(tok, next)) break;
+            std::string piece = tokenizer_piece(tok, next);
+            fputs(piece.c_str(), stdout); fflush(stdout); reply += piece;
+            if (!eval(&next, 1)) { printf("\n[eval error]\n"); break; }
+            evald += 1;
+        }
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        printf("\n\033[2m[%d tok, %.2f tok/s]\033[0m\n", steps, steps / (secs > 0 ? secs : 1));
+        msgs.push_back({"assistant", reply});
+        prev_fmt = tokenizer_apply_chat(tok, msgs, false);
+    };
+    if (interactive) {
+        std::string line;
+        while (true) {
+            fputs("\n>>> ", stdout); fflush(stdout);
+            if (!std::getline(std::cin, line)) break;
+            if (line == "/bye" || line == "/exit") break;
+            if (line == "/reset") { msgs.clear(); prev_fmt.clear(); evald = 0; reset(); printf("(context cleared)\n"); continue; }
+            if (line.empty()) continue;
+            run_turn(line);
+        }
+    } else {
+        run_turn(prompt);
+    }
+}
+
+// `floatyllm run <model.gguf> [-p TEXT | -it] [-n N] [--temp T] [--budget GB] [--ctx N]`
 // vLLM-style flags + an ollama-style interactive chat TUI (multi-turn, KV persists).
+// Works for BOTH MoE (hot-expert cache) and dense (streamed via the SlotPool ring).
 static int cmd_run(int argc, char** argv) {
     std::string model, prompt; int n_pred = 256, ctx = 4096; float temp = 0.0f; double budget = 8.0; bool interactive = false;
     for (int i = 2; i < argc; ++i) {
@@ -58,64 +108,83 @@ static int cmd_run(int argc, char** argv) {
 
     GgufFile g; std::string err;
     if (!gguf_load(model.c_str(), &g, &err)) { printf("gguf_load: %s\n", err.c_str()); return 1; }
-    if (!is_moe_model(g)) { printf("run/chat currently supports MoE models (the streaming target); use the token-id path for dense.\n"); gguf_close(&g); return 1; }
-    LoadedMoeModel m;
-    if (!load_moe_model(g, &m, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
     Tokenizer tok;
     if (!tokenizer_load(model.c_str(), &tok, &err)) { printf("tokenizer: %s\n", err.c_str()); gguf_close(&g); return 1; }
-    MoeSession S;
-    if (!moe_session_init(m, ctx, budget, &S, &err)) { printf("session: %s\n", err.c_str()); return 1; }
 
-    printf("\n  FloatyLLM · %s · %d experts (%d used) · %d layers · %.0f GB fp16 streamed from disk\n",
-           m.arch.c_str(), m.mcfg.n_experts, m.mcfg.n_used, m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
-    printf("  ctx=%d  budget=%.0f GB  temp=%.2f%s\n", ctx, budget, temp,
+    if (is_moe_model(g)) {
+        LoadedMoeModel m;
+        if (!load_moe_model(g, &m, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
+        MoeSession S;
+        if (!moe_session_init(m, ctx, budget, &S, &err)) { printf("session: %s\n", err.c_str()); return 1; }
+        printf("\n  FloatyLLM · %s · MoE %d/%d experts · %d layers · %.0f GB fp16 streamed from disk\n",
+               m.arch.c_str(), m.mcfg.n_used, m.mcfg.n_experts, m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
+        printf("  ctx=%d  budget=%.0f GB  temp=%.2f%s\n", ctx, budget, temp,
+               interactive ? "   (/bye to exit, /reset to clear context)" : "");
+        auto eval = [&](const int* ids, int n) { return moe_session_eval(S, ids, n, &err); };
+        auto sample = [&]() { return moe_session_sample(S, temp, (float)rand() / ((float)RAND_MAX + 1.0f)); };
+        auto reset = [&]() { moe_session_reset(S); };
+        chat_repl(tok, interactive, prompt, n_pred, eval, sample, reset);
+        long uses = S.cache.hits + S.cache.misses;
+        if (uses > 0) printf("\n[hot-expert cache: %.1f%% hit (%ld/%ld), %ld experts streamed]\n",
+                             100.0 * S.cache.hits / uses, S.cache.hits, uses, S.cache.misses);
+        moe_session_free(&S); free_moe_model(&m);
+        tokenizer_free(&tok); gguf_close(&g);
+        return 0;
+    }
+
+    // Dense: stream Q8_0 layer blobs through the SlotPool ring (forward_logits_cached).
+    int q_bits = 8; const char* qb = getenv("SEMILLM_QBITS"); if (qb && atoi(qb) == 4) q_bits = 4;
+    LoadedModel m;
+    if (!load_model(g, &m, q_bits, &err)) { printf("load_model: %s\n", err.c_str()); gguf_close(&g); return 1; }
+    const LlamaConfig& cfg = m.cfg;
+    int max_T = ctx, qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ffn = cfg.ffn_dim;
+    RunnerBufs bufs;
+    cudaMalloc(&bufs.hidden, (size_t)max_T*cfg.dim*2); cudaMalloc(&bufs.normed, (size_t)max_T*cfg.dim*2);
+    cudaMalloc(&bufs.positions, max_T*4); cudaMalloc(&bufs.logits, (size_t)m.vocab*2);
+    cudaMalloc(&bufs.arena, (size_t)m.blob.total_elems*2);
+    LayerScratch s;
+    cudaMalloc(&s.xn,(size_t)max_T*cfg.dim*2); cudaMalloc(&s.q,(size_t)max_T*qd*2); cudaMalloc(&s.k,(size_t)max_T*kvd*2);
+    cudaMalloc(&s.v,(size_t)max_T*kvd*2); cudaMalloc(&s.att,(size_t)max_T*qd*2); cudaMalloc(&s.proj,(size_t)max_T*cfg.dim*2);
+    cudaMalloc(&s.gate,(size_t)max_T*ffn*2); cudaMalloc(&s.up,(size_t)max_T*ffn*2);
+    int n_slots = 4, batch_layers = 1;
+    const char* se = getenv("SEMILLM_SLOTS"); if (se && atoi(se) >= 2) n_slots = atoi(se);
+    const char* be = getenv("SEMILLM_BATCH"); if (be && atoi(be) >= 1) batch_layers = atoi(be);
+    size_t slot_elems = ((size_t)batch_layers * m.q8_layer_bytes + 1) / 2;
+    SlotPool pool; slotpool_create(&pool, n_slots, slot_elems);
+    KVCache kv; kv.n_layers = m.n_layers; kv.max_T = max_T; kv.kvd = kvd; kv.len = 0;
+    cudaMalloc(&kv.K, (size_t)m.n_layers*max_T*kvd*2); cudaMalloc(&kv.V, (size_t)m.n_layers*max_T*kvd*2);
+    int* d_ids; cudaMalloc(&d_ids, max_T*4);
+    cudaStream_t cs, cms; cudaStreamCreate(&cs); cudaStreamCreate(&cms);
+    Gemm gemm; gemm_create(&gemm);
+    std::vector<__half> hl(m.vocab); std::vector<float> lf(m.vocab);
+
+    printf("\n  FloatyLLM · %s · dense · %d layers · %.1f GB Q%d streamed (%d-slot ring)\n",
+           m.arch.c_str(), m.n_layers, m.q8_layer_bytes / 1e9 * m.n_layers, m.q_bits, n_slots);
+    printf("  ctx=%d  temp=%.2f%s\n", ctx, temp,
            interactive ? "   (/bye to exit, /reset to clear context)" : "");
 
-    std::vector<std::pair<std::string, std::string>> msgs;
-    std::string prev_fmt;
-    srand(1234);
-    auto run_turn = [&](const std::string& user) {
-        msgs.push_back({"user", user});
-        std::string fmt = tokenizer_apply_chat(tok, msgs, true);
-        if (fmt.empty()) fmt = prev_fmt + user;              // no chat template: treat as raw text
-        std::string delta = fmt.size() >= prev_fmt.size() ? fmt.substr(prev_fmt.size()) : fmt;
-        bool add_special = S.len == 0;   // BOS only on the first turn
-        std::vector<int> ids = tokenizer_encode(tok, delta, add_special);
-        if (ids.empty()) { printf("[empty prompt]\n"); return; }
-        if (!moe_session_eval(S, ids.data(), (int)ids.size(), &err)) { printf("[eval: %s]\n", err.c_str()); return; }
-        std::string reply;
-        auto t0 = std::chrono::steady_clock::now();
-        int steps = 0;
-        for (; steps < n_pred; ++steps) {
-            int next = moe_session_sample(S, temp, (float)rand() / ((float)RAND_MAX + 1.0f));
-            if (tokenizer_is_eog(tok, next)) break;
-            std::string piece = tokenizer_piece(tok, next);
-            fputs(piece.c_str(), stdout); fflush(stdout); reply += piece;
-            if (!moe_session_eval(S, &next, 1, &err)) { printf("\n[eval: %s]\n", err.c_str()); break; }
-        }
-        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        printf("\n\033[2m[%d tok, %.2f tok/s]\033[0m\n", steps, steps / (secs > 0 ? secs : 1));
-        msgs.push_back({"assistant", reply});
-        prev_fmt = tokenizer_apply_chat(tok, msgs, false);
+    auto eval = [&](const int* ids, int n) -> bool {
+        if (kv.len + n > max_T) { printf("[ctx exceeded]\n"); return false; }
+        cudaMemcpy(d_ids, ids, n*4, cudaMemcpyHostToDevice);
+        forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.q_bits, m.n_layers, batch_layers,
+                              m.rw, d_ids, n, kv.len, kv, m.vocab, bufs, s, pool, &gemm, cs, cms);
+        kv.len += n;
+        return cudaGetLastError() == cudaSuccess;
     };
+    auto sample = [&]() -> int {
+        cudaMemcpy(hl.data(), bufs.logits, m.vocab*2, cudaMemcpyDeviceToHost);
+        for (int v = 0; v < m.vocab; ++v) lf[v] = __half2float(hl[v]);
+        return temp > 0.0f ? sample_temperature(lf.data(), m.vocab, temp, (float)rand()/((float)RAND_MAX+1.0f))
+                           : sample_greedy(lf.data(), m.vocab);
+    };
+    auto reset = [&]() { kv.len = 0; };
+    chat_repl(tok, interactive, prompt, n_pred, eval, sample, reset);
 
-    if (interactive) {
-        std::string line;
-        while (true) {
-            fputs("\n>>> ", stdout); fflush(stdout);
-            if (!std::getline(std::cin, line)) break;
-            if (line == "/bye" || line == "/exit") break;
-            if (line == "/reset") { msgs.clear(); prev_fmt.clear(); moe_session_reset(S); printf("(context cleared)\n"); continue; }
-            if (line.empty()) continue;
-            run_turn(line);
-        }
-    } else {
-        run_turn(prompt);
-    }
-    long uses = S.cache.hits + S.cache.misses;
-    if (uses > 0) printf("\n[hot-expert cache: %.1f%% hit (%ld/%ld), %ld experts streamed]\n",
-                         100.0 * S.cache.hits / uses, S.cache.hits, uses, S.cache.misses);
-    moe_session_free(&S); tokenizer_free(&tok); free_moe_model(&m); gguf_close(&g);
+    cudaFree(kv.K); cudaFree(kv.V); cudaFree(d_ids);
+    cudaFree(bufs.hidden); cudaFree(bufs.normed); cudaFree(bufs.positions); cudaFree(bufs.logits); cudaFree(bufs.arena);
+    cudaFree(s.xn); cudaFree(s.q); cudaFree(s.k); cudaFree(s.v); cudaFree(s.att); cudaFree(s.proj); cudaFree(s.gate); cudaFree(s.up);
+    slotpool_destroy(&pool); gemm_destroy(&gemm); free_model(&m);
+    tokenizer_free(&tok); gguf_close(&g);
     return 0;
 }
 
