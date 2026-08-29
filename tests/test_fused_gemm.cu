@@ -44,10 +44,14 @@ static int run(const char* name, uint32_t type, int block_bytes, int block_elems
     cudaMemcpy(y_gpu.data(), dy, y_gpu.size() * 2, cudaMemcpyDeviceToHost);
     cudaFree(dW); cudaFree(dx); cudaFree(dy);
 
-    float max_err = 0;
-    for (size_t i = 0; i < y_ref.size(); ++i) max_err = fmaxf(max_err, fabsf(__half2float(y_gpu[i]) - y_ref[i]));
-    printf("%s: max abs err = %.4f  %s\n", name, max_err, max_err < 0.05f ? "PASS" : "FAIL");
-    return max_err < 0.05f ? 0 : 1;
+    // fp16 output has ~2^-11 relative precision, so compare RELATIVE error.
+    float max_rel = 0;
+    for (size_t i = 0; i < y_ref.size(); ++i) {
+        float e = fabsf(__half2float(y_gpu[i]) - y_ref[i]) / (fabsf(y_ref[i]) + 1e-2f);
+        max_rel = fmaxf(max_rel, e);
+    }
+    printf("%s: max rel err = %.4f  %s\n", name, max_rel, max_rel < 0.02f ? "PASS" : "FAIL");
+    return max_rel < 0.02f ? 0 : 1;
 }
 
 static void ref_q8_0(const uint8_t* blk, int b, float* row) {
