@@ -302,7 +302,7 @@ bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession
     S->w.wv=S->arena+m.blob.off_wv; S->w.wo=S->arena+m.blob.off_wo; S->w.ffn_norm=S->arena+m.blob.off_ffn_norm;
     S->w.w_gate=S->arena+m.blob.off_router; S->w.wgate=S->wg.data(); S->w.wup=S->wu.data(); S->w.wdown=S->wd.data();
 
-    cudaMalloc(&S->d_ids, max_T*4);
+    cudaMalloc(&S->d_ids, max_T*4); cudaMalloc(&S->d_arg, 4);
     cudaStreamCreate(&S->cm); cudaStreamCreate(&S->cs);
     S->ev.resize(E); for (int e=0;e<E;++e) cudaEventCreateWithFlags(&S->ev[e], cudaEventDisableTiming);
     gemm_create(&S->gemm);
@@ -451,12 +451,30 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
     return true;
 }
 
+// GPU greedy argmax: one block reduces the whole vocab, so the common temp=0 path
+// avoids copying the full logits vector to the host + a CPU scan every token.
+__global__ void argmax_kernel(const __half* logits, int n, int* out) {
+    __shared__ float sval[256]; __shared__ int sidx[256];
+    int t = threadIdx.x; float best = -1e30f; int bi = 0;
+    for (int v = t; v < n; v += blockDim.x) { float f = __half2float(logits[v]); if (f > best) { best = f; bi = v; } }
+    sval[t] = best; sidx[t] = bi; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (t < s && sval[t + s] > sval[t]) { sval[t] = sval[t + s]; sidx[t] = sidx[t + s]; }
+        __syncthreads();
+    }
+    if (t == 0) out[0] = sidx[0];
+}
+
 int moe_session_sample(MoeSession& S, float temp, float rand01) {
     int vocab = S.m->vocab;
+    if (temp <= 0.0f) {                                   // greedy: argmax on GPU, copy one int
+        argmax_kernel<<<1, 256, 0, S.cm>>>(S.logits_d, vocab, S.d_arg);
+        int idx = 0; cudaMemcpy(&idx, S.d_arg, 4, cudaMemcpyDeviceToHost);
+        return idx;
+    }
     cudaMemcpy(S.hl.data(), S.logits_d, vocab*2, cudaMemcpyDeviceToHost);
     for (int v=0;v<vocab;++v) S.lf[v]=__half2float(S.hl[v]);
-    return temp > 0.0f ? sample_temperature(S.lf.data(), vocab, temp, rand01)
-                       : sample_greedy(S.lf.data(), vocab);
+    return sample_temperature(S.lf.data(), vocab, temp, rand01);
 }
 
 void moe_session_reset(MoeSession& S) { S.len = 0; S.kv.len = 0; }
@@ -470,7 +488,7 @@ void moe_session_free(MoeSession* S) {
     if (S->cs) cudaStreamDestroy(S->cs); if (S->cm) cudaStreamDestroy(S->cm);
     gemm_destroy(&S->gemm);
     cudaFree(S->hidden); cudaFree(S->normed); cudaFree(S->arena); cudaFree(S->d_deq); cudaFree(S->d_qstage);
-    cudaFree(S->logits_d); cudaFree(S->positions); cudaFree(S->d_ids);
+    cudaFree(S->logits_d); cudaFree(S->positions); cudaFree(S->d_ids); cudaFree(S->d_arg);
     cudaFree(S->s.xn); cudaFree(S->s.q); cudaFree(S->s.k); cudaFree(S->s.v); cudaFree(S->s.att); cudaFree(S->s.proj);
     cudaFree(S->s.gate); cudaFree(S->s.up);
     cudaFree(S->ms.logits); cudaFree(S->ms.route_w); cudaFree(S->ms.gate); cudaFree(S->ms.up); cudaFree(S->ms.ye); cudaFree(S->ms.moe_out);
