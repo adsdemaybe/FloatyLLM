@@ -117,6 +117,52 @@ void dequant_q6_K(const BlockQ6K* d_blocks, __half* d_out, int n_blocks, cudaStr
     dequant_q6_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
 }
 
+// Q3_K super-block scale unpack: 12 packed bytes -> 16 6-bit scales in sc[0..15] (as int8,
+// caller subtracts 32). Mirrors llama.cpp's aux shuffle. Shared by dequant + GEMV.
+__device__ __forceinline__ void unpack_q3_scales(const uint8_t* s, int8_t* sc) {
+    uint32_t a0 = s[0]|(s[1]<<8)|(s[2]<<16)|((uint32_t)s[3]<<24);
+    uint32_t a1 = s[4]|(s[5]<<8)|(s[6]<<16)|((uint32_t)s[7]<<24);
+    uint32_t a2 = s[8]|(s[9]<<8)|(s[10]<<16)|((uint32_t)s[11]<<24);
+    const uint32_t km1 = 0x03030303u, km2 = 0x0f0f0f0fu;
+    uint32_t aux[4];
+    aux[2] = ((a0 >> 4) & km2) | (((a2 >> 4) & km1) << 4);
+    aux[3] = ((a1 >> 4) & km2) | (((a2 >> 6) & km1) << 4);
+    aux[0] = (a0 & km2) | (((a2 >> 0) & km1) << 4);
+    aux[1] = (a1 & km2) | (((a2 >> 2) & km1) << 4);
+    const int8_t* p = (const int8_t*)aux;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) sc[i] = p[i];
+}
+
+// Q3_K: 3-bit weights (2 bits in qs, 3rd bit in hmask), 16 6-bit sub-block scales.
+// value(pos) = d * (scale-32) * ((qs bits) - (hmask bit ? 0 : 4)). See llama.cpp
+// dequantize_row_q3_K. One thread per 256-value super-block.
+__global__ void dequant_q3_K_kernel(const BlockQ3K* blocks, __half* y, int nb) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) return;
+    const BlockQ3K& b = blocks[i];
+    float d = __half2float(b.d);
+    int8_t sc[16]; unpack_q3_scales(b.scales, sc);
+    __half* yy = y + (size_t)i * 256;
+    for (int h = 0; h < 2; ++h)
+        for (int j = 0; j < 4; ++j)
+            for (int r = 0; r < 32; ++r) {
+                int qidx = h * 32 + r;
+                int shift = 2 * j;
+                uint8_t mbit = (uint8_t)(1u << (h * 4 + j));
+                int sidx = h * 8 + j * 2 + (r >= 16 ? 1 : 0);
+                int ql = (b.qs[qidx] >> shift) & 3;
+                int hb = (b.hmask[r] & mbit) ? 0 : 4;
+                yy[h * 128 + j * 32 + r] = __float2half(d * (float)(sc[sidx] - 32) * (float)(ql - hb));
+            }
+}
+
+void dequant_q3_K(const BlockQ3K* d_blocks, __half* d_out, int n_blocks, cudaStream_t stream) {
+    if (n_blocks <= 0) return;
+    int t = 128;
+    dequant_q3_K_kernel<<<(n_blocks + t - 1) / t, t, 0, stream>>>(d_blocks, d_out, n_blocks);
+}
+
 __global__ void transpose_kernel(const __half* src, __half* dst, int rows, int cols) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * cols) return;
@@ -144,6 +190,7 @@ void dequant_to_fp16(const uint8_t* q, __half* out, uint32_t type, size_t n, cud
             cudaMemcpyAsync(out, q, n * sizeof(__half), cudaMemcpyDeviceToDevice, stream); break;
         case 2:  dequant_q4_0((const BlockQ40*)q, out, (int)(n / 32), stream); break;   // Q4_0
         case 8:  dequant_q8_0((const BlockQ80*)q, out, (int)(n / 32), stream); break;   // Q8_0
+        case 11: dequant_q3_K((const BlockQ3K*)q, out, (int)(n / 256), stream); break;  // Q3_K
         case 12: dequant_q4_K((const BlockQ4K*)q, out, (int)(n / 256), stream); break;  // Q4_K
         case 13: dequant_q5_K((const BlockQ5K*)q, out, (int)(n / 256), stream); break;  // Q5_K
         case 14: dequant_q6_K((const BlockQ6K*)q, out, (int)(n / 256), stream); break;  // Q6_K

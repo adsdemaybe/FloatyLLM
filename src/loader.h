@@ -16,7 +16,7 @@ enum GgufValueType {
 
 // ggml tensor types we care about (values match the ggml enum).
 enum GgmlType { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q5_0 = 6,
-                GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 };
+                GGML_Q8_0 = 8, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 };
 
 struct MetaValue {
     int type = 0;        // GgufValueType
