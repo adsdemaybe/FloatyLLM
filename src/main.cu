@@ -111,7 +111,9 @@ static int cmd_run(int argc, char** argv) {
     } else {
         run_turn(prompt);
     }
-    if (S.exp_total > 0) printf("\n[active-expert streaming: %.1f%% of dense expert I/O]\n", 100.0 * S.exp_streamed / S.exp_total);
+    long uses = S.cache.hits + S.cache.misses;
+    if (uses > 0) printf("\n[hot-expert cache: %.1f%% hit (%ld/%ld), %ld experts streamed]\n",
+                         100.0 * S.cache.hits / uses, S.cache.hits, uses, S.cache.misses);
     moe_session_free(&S); tokenizer_free(&tok); free_moe_model(&m); gguf_close(&g);
     return 0;
 }
