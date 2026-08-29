@@ -48,8 +48,8 @@ size_t scalar_width(int type) {
     }
 }
 
-// Read a metadata value of the given type into mv (scalars/strings stored;
-// arrays consumed but not retained). Advances the cursor.
+// Read a metadata value of the given type into mv (scalars/strings stored; string
+// arrays retained in mv.strs, numeric arrays consumed but not retained). Advances the cursor.
 void read_value(Cursor& c, int type, MetaValue& mv) {
     mv.type = type;
     switch (type) {
@@ -68,8 +68,9 @@ void read_value(Cursor& c, int type, MetaValue& mv) {
         case GGUF_ARRAY: {
             uint32_t elem_type = c.read_scalar<uint32_t>();
             uint64_t count = c.read_scalar<uint64_t>();
+            if (elem_type == GGUF_STRING) mv.strs.reserve(count);
             for (uint64_t i = 0; i < count && c.ok; ++i) {
-                if (elem_type == GGUF_STRING) { c.read_string(); }
+                if (elem_type == GGUF_STRING) { mv.strs.push_back(c.read_string()); }  // retained (vocab, merges)
                 else {
                     size_t w = scalar_width(elem_type);
                     if (w == 0 || !c.need(w)) { c.ok = false; return; }
