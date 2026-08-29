@@ -1,4 +1,4 @@
-# SemiLLM
+# FloatyLLM
 
 Latency-hidden mixed-precision streaming LLM inference, written in CUDA.
 

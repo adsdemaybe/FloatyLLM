@@ -1,5 +1,5 @@
 // Streaming scheduler: ring of VRAM weight slots + copy/compute pipeline that
-// drives layer_forward over host-resident weights. The core of SemiLLM - run a
+// drives layer_forward over host-resident weights. The core of FloatyLLM - run a
 // model whose weights exceed VRAM by streaming layers. PLAN sec 6. fp16 weights
 // for now (quantized streaming + dequant is a later refinement).
 #pragma once
