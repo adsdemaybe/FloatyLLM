@@ -78,6 +78,13 @@ struct MoeSession {
     LayerScratch s{}; MoeScratch ms{}; KVCache kv{};
     std::vector<const __half*> wg, wu, wd; MoeLayerWeights w{};   // per-layer active-expert ptrs
     ExpertCache cache;
+    // Device-resident QUANTIZED weight cache for the dense fused-decode path: GB10 host
+    // mmap reads cap ~160 GB/s vs ~220 GB/s from GPU-local memory, so hold as many whole
+    // layers as the budget allows in device DRAM. qsrc[L][i] = effective src of mat i of
+    // layer L (device pool if resident, else the host mmap pointer).
+    uint8_t* qpool = nullptr;
+    std::vector<std::vector<const uint8_t*>> qsrc;
+    int qres_layers = 0;
     cudaStream_t cm = nullptr, cs = nullptr; std::vector<cudaEvent_t> ev; Gemm gemm{};
     std::vector<__half> hl; std::vector<float> lf;
     long exp_streamed = 0, exp_total = 0;   // instrumentation across all evals

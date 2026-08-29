@@ -246,14 +246,11 @@ bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession
     c.n_experts = E; c.stride = stride;
     int C;
     if (E == 1) {
-        // Dense: one FFN per layer. A per-layer cache would pin ALL layers (the whole model
-        // in fp16). Use a bounded GLOBAL LRU instead -> stream layers, keep a few resident.
-        C = budget_gb > 0 ? (int)(budget_gb / expert_gb) : 2;
-        if (C < 2) C = 2;                                 // >=2 so the copy stream can prefetch
-        if (C > m.n_layers) C = m.n_layers;
+        // Dense: the fused-decode path reads QUANTIZED weights (device quant cache below),
+        // not the fp16 expert cache. Keep the fp16 cache minimal (used only by prefill's
+        // old dequant path); the budget goes to the device quant cache (qpool).
+        C = 2;
         c.global = true; c.capacity = C; c.per_layer = 1;
-        printf("dense stream: %d/%d layer-FFNs resident (%.2f GB), rest streamed per token | budget=%.1f GB\n",
-               C, m.n_layers, C*expert_gb, budget_gb);
     } else {
         int per_layer = budget_gb > 0 ? (int)(budget_gb / expert_gb / m.n_layers) : mc.n_used;
         if (per_layer < mc.n_used) per_layer = mc.n_used;
@@ -267,6 +264,36 @@ bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession
     cudaMalloc(&c.pool, (size_t)C * stride * 2);
     c.slot_key.assign(C, -1); c.slot_lru.assign(C, 0);
     c.slot_evt.resize(C); for (int i=0;i<C;++i) cudaEventCreateWithFlags(&c.slot_evt[i], cudaEventDisableTiming);
+
+    // Device quant cache (dense fused-decode): copy as many whole layers' quantized weights
+    // into device DRAM as the budget allows; the rest are read from the host mmap directly.
+    S->qsrc.resize(m.n_layers);
+    if (E == 1 && budget_gb > 0) {
+        size_t budget_bytes = (size_t)(budget_gb * 1e9);
+        std::vector<size_t> lb(m.n_layers, 0);
+        for (int L = 0; L < m.n_layers; ++L) { size_t b = 0; for (auto& mr : m.layers[L]) b += mr.quant_bytes; lb[L] = b; }
+        size_t acc = 0; int Kq = 0;
+        for (int L = 0; L < m.n_layers; ++L) { if (acc + lb[L] <= budget_bytes) { acc += lb[L]; ++Kq; } else break; }
+        if (Kq > 0) cudaMalloc(&S->qpool, acc);
+        S->qres_layers = Kq;
+        size_t off = 0;
+        for (int L = 0; L < m.n_layers; ++L) {
+            S->qsrc[L].resize(m.layers[L].size());
+            for (size_t i = 0; i < m.layers[L].size(); ++i) {
+                const MatRef& mr = m.layers[L][i];
+                if (L < Kq) { cudaMemcpy(S->qpool + off, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice);
+                              S->qsrc[L][i] = S->qpool + off; off += mr.quant_bytes; }
+                else S->qsrc[L][i] = mr.src;
+            }
+        }
+        printf("dense fused decode: %d/%d layers resident in device quant cache (%.2f GB), rest from host mmap | budget=%.1f GB\n",
+               Kq, m.n_layers, acc / 1e9, budget_gb);
+    } else {
+        for (int L = 0; L < m.n_layers; ++L) {
+            S->qsrc[L].resize(m.layers[L].size());
+            for (size_t i = 0; i < m.layers[L].size(); ++i) S->qsrc[L][i] = m.layers[L][i].src;
+        }
+    }
 
     S->wg.resize(E); S->wu.resize(E); S->wd.resize(E);   // per-layer active-expert ptrs (set in eval)
     S->w.attn_norm=S->arena+m.blob.off_attn_norm; S->w.wq=S->arena+m.blob.off_wq; S->w.wk=S->arena+m.blob.off_wk;
@@ -306,26 +333,30 @@ static bool dense_decode_layer(MoeSession& S, int L, int len_before, cudaStream_
     int dim = cfg.dim, qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ef = m.mcfg.expert_ffn;
     float scale = 1.0f / sqrtf((float)cfg.head_dim);
     const MoeLayerBlob& b = m.blob;
-    const MatRef *an=nullptr,*fn=nullptr,*wq=nullptr,*wk=nullptr,*wv=nullptr,*wo=nullptr,*wg=nullptr,*wu=nullptr,*wd=nullptr;
-    for (const MatRef& mr : m.layers[L]) {
-        size_t off = mr.arena_off;
-        if (mr.is_norm && off == b.off_attn_norm) an = &mr;
-        else if (mr.is_norm && off == b.off_ffn_norm) fn = &mr;
-        else if (off == b.off_wq) wq = &mr;
-        else if (off == b.off_wk) wk = &mr;
-        else if (off == b.off_wv) wv = &mr;
-        else if (off == b.off_wo) wo = &mr;
-        else if (off == b.off_experts + b.off_egate) wg = &mr;
-        else if (off == b.off_experts + b.off_eup) wu = &mr;
-        else if (off == b.off_experts + b.off_edown) wd = &mr;
+    // Resolve each role's MatRef + its effective src (device quant cache if resident, else
+    // host mmap) by index into qsrc[L].
+    struct Role { const MatRef* mr = nullptr; const uint8_t* src = nullptr; };
+    Role an, fn, wq, wk, wv, wo, wg, wu, wd;
+    const std::vector<MatRef>& layer = m.layers[L];
+    for (size_t i = 0; i < layer.size(); ++i) {
+        const MatRef& mr = layer[i]; const uint8_t* src = S.qsrc[L][i]; size_t off = mr.arena_off;
+        if (mr.is_norm && off == b.off_attn_norm) { an.mr = &mr; an.src = src; }
+        else if (mr.is_norm && off == b.off_ffn_norm) { fn.mr = &mr; fn.src = src; }
+        else if (off == b.off_wq) { wq.mr = &mr; wq.src = src; }
+        else if (off == b.off_wk) { wk.mr = &mr; wk.src = src; }
+        else if (off == b.off_wv) { wv.mr = &mr; wv.src = src; }
+        else if (off == b.off_wo) { wo.mr = &mr; wo.src = src; }
+        else if (off == b.off_experts + b.off_egate) { wg.mr = &mr; wg.src = src; }
+        else if (off == b.off_experts + b.off_eup) { wu.mr = &mr; wu.src = src; }
+        else if (off == b.off_experts + b.off_edown) { wd.mr = &mr; wd.src = src; }
     }
-    if (!an||!fn||!wq||!wk||!wv||!wo||!wg||!wu||!wd) return false;
+    if (!an.mr||!fn.mr||!wq.mr||!wk.mr||!wv.mr||!wo.mr||!wg.mr||!wu.mr||!wd.mr) return false;
 
     // Norms are F32/F16 -> dequant into the (small) arena slots the old path used.
     __half* an_w = S.arena + b.off_attn_norm;
     __half* fn_w = S.arena + b.off_ffn_norm;
-    dequant_to_fp16(an->src, an_w, an->type, dim, st);
-    dequant_to_fp16(fn->src, fn_w, fn->type, dim, st);
+    dequant_to_fp16(an.src, an_w, an.mr->type, dim, st);
+    dequant_to_fp16(fn.src, fn_w, fn.mr->type, dim, st);
 
     __half* Kbase = S.kv.K + (size_t)L * S.kv.max_T * kvd;
     __half* Vbase = S.kv.V + (size_t)L * S.kv.max_T * kvd;
@@ -333,22 +364,22 @@ static bool dense_decode_layer(MoeSession& S, int L, int len_before, cudaStream_
     __half* Vdst = Vbase + (size_t)len_before * kvd;
 
     rmsnorm(S.hidden, an_w, S.s.xn, 1, dim, cfg.eps, st);
-    fused_gemv(wq->src, S.s.xn, S.s.q, 1, qd, dim, wq->type, st);
-    fused_gemv(wk->src, S.s.xn, Kdst, 1, kvd, dim, wk->type, st);
-    fused_gemv(wv->src, S.s.xn, Vdst, 1, kvd, dim, wv->type, st);
+    fused_gemv(wq.src, S.s.xn, S.s.q, 1, qd, dim, wq.mr->type, st);
+    fused_gemv(wk.src, S.s.xn, Kdst, 1, kvd, dim, wk.mr->type, st);
+    fused_gemv(wv.src, S.s.xn, Vdst, 1, kvd, dim, wv.mr->type, st);
     rope_inplace(S.s.q, S.positions, 1, cfg.n_heads, cfg.head_dim, cfg.rope_base, st);
     rope_inplace(Kdst, S.positions, 1, cfg.n_kv_heads, cfg.head_dim, cfg.rope_base, st);
     attention_cached(S.s.q, Kbase, Vbase, S.s.att, 1, len_before,
                      cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, st);
-    fused_gemv(wo->src, S.s.att, S.s.proj, 1, dim, qd, wo->type, st);
+    fused_gemv(wo.src, S.s.att, S.s.proj, 1, dim, qd, wo.mr->type, st);
     residual_add(S.hidden, S.s.proj, dim, st);
 
     rmsnorm(S.hidden, fn_w, S.s.xn, 1, dim, cfg.eps, st);
-    fused_gemv(wg->src, S.s.xn, S.ms.gate, 1, ef, dim, wg->type, st);
-    fused_gemv(wu->src, S.s.xn, S.ms.up, 1, ef, dim, wu->type, st);
+    fused_gemv(wg.src, S.s.xn, S.ms.gate, 1, ef, dim, wg.mr->type, st);
+    fused_gemv(wu.src, S.s.xn, S.ms.up, 1, ef, dim, wu.mr->type, st);
     silu(S.ms.gate, S.ms.gate, ef, st);
     elementwise_mul(S.ms.gate, S.ms.up, S.ms.gate, ef, st);
-    fused_gemv(wd->src, S.ms.gate, S.ms.ye, 1, dim, ef, wd->type, st);
+    fused_gemv(wd.src, S.ms.gate, S.ms.ye, 1, dim, ef, wd.mr->type, st);
     residual_add(S.hidden, S.ms.ye, dim, st);
     return true;
 }
@@ -428,6 +459,7 @@ void moe_session_free(MoeSession* S) {
     for (auto ev : S->ev) cudaEventDestroy(ev);
     for (auto ev : S->cache.slot_evt) cudaEventDestroy(ev);
     cudaFree(S->cache.pool);
+    if (S->qpool) cudaFree(S->qpool);
     if (S->cs) cudaStreamDestroy(S->cs); if (S->cm) cudaStreamDestroy(S->cm);
     gemm_destroy(&S->gemm);
     cudaFree(S->hidden); cudaFree(S->normed); cudaFree(S->arena); cudaFree(S->d_deq); cudaFree(S->d_qstage);
