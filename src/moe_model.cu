@@ -174,22 +174,46 @@ void free_moe_model(LoadedMoeModel* m) {
     m->rw.token_embd = nullptr;
 }
 
-// Stream one weight matrix (DMA quant -> GPU dequant -> transpose into the arena) on `st`.
-static void session_stream_mat(MoeSession& S, const MatRef& mr, cudaStream_t st) {
+// Stream one weight matrix (DMA quant -> GPU dequant -> transpose) into `dest` on `st`.
+static void session_stream_to(MoeSession& S, const MatRef& mr, __half* dest, cudaStream_t st) {
     cudaMemcpyAsync(S.d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, st);
-    if (mr.is_norm) dequant_to_fp16(S.d_qstage, S.arena + mr.arena_off, mr.type, mr.n_elems, st);
+    if (mr.is_norm) dequant_to_fp16(S.d_qstage, dest, mr.type, mr.n_elems, st);
     else { dequant_to_fp16(S.d_qstage, S.d_deq, mr.type, mr.n_elems, st);
-           transpose_fp16(S.d_deq, S.arena + mr.arena_off, mr.out, mr.in, st); }
+           transpose_fp16(S.d_deq, dest, mr.out, mr.in, st); }
+}
+// Non-expert weights live at fixed offsets in the (small) per-layer arena.
+static void session_stream_mat(MoeSession& S, const MatRef& mr, cudaStream_t st) {
+    session_stream_to(S, mr, S.arena + mr.arena_off, st);
+}
+
+// Resolve expert `e` of layer `L` to a cache slot, searching only THIS layer's region
+// (slots [L*per_layer, +per_layer)). *hit if already resident. Miss => LRU-evict within
+// the layer's own region, so other layers are never disturbed.
+static int cache_slot(ExpertCache& c, int L, int e, bool* hit) {
+    int r0 = L * c.per_layer;
+    for (int j = 0; j < c.per_layer; ++j)
+        if (c.slot_key[r0 + j] == e) { c.slot_lru[r0 + j] = ++c.tick; *hit = true; ++c.hits; return r0 + j; }
+    int victim = r0; uint64_t best = UINT64_MAX;
+    for (int j = 0; j < c.per_layer; ++j) {
+        int s = r0 + j;
+        if (c.slot_key[s] < 0) { victim = s; break; }       // prefer an empty slot
+        if (c.slot_lru[s] < best) { best = c.slot_lru[s]; victim = s; }
+    }
+    c.slot_key[victim] = e; c.slot_lru[victim] = ++c.tick;
+    *hit = false; ++c.misses;
+    return victim;
 }
 
 bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession* S, std::string* err) {
     const LlamaConfig& cfg = m.cfg; const MoeConfig& mc = m.mcfg;
     int dim = cfg.dim, qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ef = mc.expert_ffn, E = mc.n_experts;
-    size_t per = m.blob.total_elems;
     S->m = &m; S->max_T = max_T; S->budget_gb = budget_gb; S->len = 0;
 
+    // Experts now live in the hot-expert cache, so the arena only holds the (small)
+    // non-expert weights of one layer: attn_norm | Wq | Wk | Wv | Wo | ffn_norm | router.
+    size_t arena_elems = m.blob.off_experts;
     cudaMalloc(&S->hidden,(size_t)max_T*dim*2); cudaMalloc(&S->normed,(size_t)max_T*dim*2);
-    cudaMalloc(&S->arena, per*2); cudaMalloc(&S->d_deq, m.max_elems*2); cudaMalloc(&S->d_qstage, m.max_quant_bytes);
+    cudaMalloc(&S->arena, arena_elems*2); cudaMalloc(&S->d_deq, m.max_elems*2); cudaMalloc(&S->d_qstage, m.max_quant_bytes);
     cudaMalloc(&S->logits_d,(size_t)m.vocab*2); cudaMalloc(&S->positions, max_T*4);
     cudaMalloc(&S->s.xn,(size_t)max_T*dim*2); cudaMalloc(&S->s.q,(size_t)max_T*qd*2); cudaMalloc(&S->s.k,(size_t)max_T*kvd*2);
     cudaMalloc(&S->s.v,(size_t)max_T*kvd*2); cudaMalloc(&S->s.att,(size_t)max_T*qd*2); cudaMalloc(&S->s.proj,(size_t)max_T*dim*2);
@@ -201,14 +225,24 @@ bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession
     S->kv.n_layers=m.n_layers; S->kv.max_T=max_T; S->kv.kvd=kvd; S->kv.len=0;
     cudaMalloc(&S->kv.K,(size_t)m.n_layers*max_T*kvd*2); cudaMalloc(&S->kv.V,(size_t)m.n_layers*max_T*kvd*2);
 
-    double arena_gb = per*2/1e9;
-    int K = budget_gb > 0 ? (int)(budget_gb / arena_gb) : 1; if (K < 1) K = 1;
-    printf("per-layer arena=%.2f GB, budget=%.1f GB -> up to K=%d layers fit (streaming 1 at a time)\n",
-           arena_gb, budget_gb, K);
+    // Hot-expert cache sized from the budget, PARTITIONED PER LAYER:
+    // per_layer = clamp(budget / one-expert-bytes / n_layers, n_used, n_experts).
+    size_t stride = m.blob.expert_stride;                 // fp16 elems per expert (gate|up|down)
+    double expert_gb = stride * 2.0 / 1e9;
+    int per_layer = budget_gb > 0 ? (int)(budget_gb / expert_gb / m.n_layers) : mc.n_used;
+    if (per_layer < mc.n_used) per_layer = mc.n_used;     // hold at least a layer's active set
+    if (per_layer > E) per_layer = E;                     // whole layer resident = cap
+    int C = m.n_layers * per_layer;
+    ExpertCache& c = S->cache;
+    c.capacity = C; c.per_layer = per_layer; c.n_experts = E; c.stride = stride;
+    cudaMalloc(&c.pool, (size_t)C * stride * 2);
+    c.slot_key.assign(C, -1); c.slot_lru.assign(C, 0);
+    c.slot_evt.resize(C); for (int i=0;i<C;++i) cudaEventCreateWithFlags(&c.slot_evt[i], cudaEventDisableTiming);
+    printf("hot-expert cache: %d/%d experts per layer resident (%.2f GB total) | budget=%.1f GB%s\n",
+           per_layer, E, C*expert_gb, budget_gb,
+           C*expert_gb > budget_gb + 0.01 ? "  (min n_used/layer exceeds budget)" : "");
 
-    S->wg.resize(E); S->wu.resize(E); S->wd.resize(E);
-    for (int e=0;e<E;++e){ size_t eb=m.blob.off_experts+(size_t)e*m.blob.expert_stride;
-        S->wg[e]=S->arena+eb+m.blob.off_egate; S->wu[e]=S->arena+eb+m.blob.off_eup; S->wd[e]=S->arena+eb+m.blob.off_edown; }
+    S->wg.resize(E); S->wu.resize(E); S->wd.resize(E);   // per-layer active-expert ptrs (set in eval)
     S->w.attn_norm=S->arena+m.blob.off_attn_norm; S->w.wq=S->arena+m.blob.off_wq; S->w.wk=S->arena+m.blob.off_wk;
     S->w.wv=S->arena+m.blob.off_wv; S->w.wo=S->arena+m.blob.off_wo; S->w.ffn_norm=S->arena+m.blob.off_ffn_norm;
     S->w.w_gate=S->arena+m.blob.off_router; S->w.wgate=S->wg.data(); S->w.wup=S->wu.data(); S->w.wdown=S->wd.data();
@@ -232,22 +266,42 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
     std::vector<int> pos(n_new); for (int i=0;i<n_new;++i) pos[i]=len_before+i;
     cudaMemcpy(S.positions, pos.data(), n_new*4, cudaMemcpyHostToDevice);
     embed_tokens(m.rw.token_embd, S.d_ids, S.hidden, n_new, dim, S.cm);
-    int active[256];
+    ExpertCache& c = S.cache;
+    int active[256]; bool miss[256]; int slot_of[256];
     for (int L=0; L<m.n_layers; ++L) {
         for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) session_stream_mat(S, mr, S.cm);   // attn + router
         int na = moe_attn_route(cfg, mc, S.w, S.hidden, S.positions, n_new, L, len_before, S.kv, S.s, S.ms, &S.gemm, S.cm, active, 256);
         moe_mlp_zero(S.ms.moe_out, n_new*dim, S.cm);
-        for (int a=0; a<na; ++a) {                             // prefetch active experts on cs
-            for (const MatRef& mr : m.layers[L]) if (mr.expert == active[a]) session_stream_mat(S, mr, S.cs);
-            cudaEventRecord(S.ev[a], S.cs);
-        }
-        for (int a=0; a<na; ++a) {                             // compute on cm, overlapped with cs
-            cudaStreamWaitEvent(S.cm, S.ev[a], 0);
-            moe_mlp_one(&S.gemm, S.s.xn, S.wg[active[a]], S.wu[active[a]], S.wd[active[a]], S.ms.route_w,
-                        S.ms.moe_out, S.ms.gate, S.ms.up, S.ms.ye, n_new, dim, ef, active[a], E, S.cm);
+        // Process active experts in WAVES of per_layer: each wave's experts get distinct
+        // cache slots (needed since the whole wave is resident during its compute), so na
+        // may exceed per_layer (prefill routes many) without corrupting slots. Decode
+        // (na <= n_used <= per_layer) is a single wave. Stream misses on cs, compute on cm.
+        for (int w0 = 0; w0 < na; w0 += c.per_layer) {
+            int wn = (na - w0 < c.per_layer) ? na - w0 : c.per_layer;
+            for (int j = 0; j < wn; ++j) {
+                int a = w0 + j, e = active[a]; bool hit;
+                int slot = cache_slot(c, L, e, &hit); slot_of[a] = slot; miss[a] = !hit;
+                __half* base = c.pool + (size_t)slot * c.stride;
+                S.wg[e] = base; S.wu[e] = base + m.blob.off_eup; S.wd[e] = base + m.blob.off_edown;
+                if (!hit) {
+                    cudaStreamWaitEvent(S.cs, c.slot_evt[slot], 0);   // prior reader of this slot done
+                    size_t eb = m.blob.off_experts + (size_t)e * m.blob.expert_stride;
+                    for (const MatRef& mr : m.layers[L]) if (mr.expert == e)
+                        session_stream_to(S, mr, base + (mr.arena_off - eb), S.cs);
+                    cudaEventRecord(S.ev[j], S.cs);                   // copy done
+                    S.exp_streamed += 1;
+                }
+            }
+            for (int j = 0; j < wn; ++j) {
+                int a = w0 + j, e = active[a];
+                if (miss[a]) cudaStreamWaitEvent(S.cm, S.ev[j], 0);
+                moe_mlp_one(&S.gemm, S.s.xn, S.wg[e], S.wu[e], S.wd[e], S.ms.route_w,
+                            S.ms.moe_out, S.ms.gate, S.ms.up, S.ms.ye, n_new, dim, ef, e, E, S.cm);
+                cudaEventRecord(c.slot_evt[slot_of[a]], S.cm);        // this slot's read is done
+            }
         }
         moe_experts_tail(cfg, mc, S.w, S.hidden, n_new, S.s, S.ms, &S.gemm, S.cm);
-        S.exp_streamed += na; S.exp_total += E;
+        S.exp_total += na;
     }
     rmsnorm(S.hidden, m.rw.final_norm, S.normed, n_new, dim, cfg.eps, S.cm);
     gemm_rowmajor(&S.gemm, m.rw.output, S.normed+(size_t)(n_new-1)*dim, S.logits_d, m.vocab, 1, dim, S.cm);
@@ -271,6 +325,8 @@ void moe_session_reset(MoeSession& S) { S.len = 0; S.kv.len = 0; }
 void moe_session_free(MoeSession* S) {
     if (!S->m) return;
     for (auto ev : S->ev) cudaEventDestroy(ev);
+    for (auto ev : S->cache.slot_evt) cudaEventDestroy(ev);
+    cudaFree(S->cache.pool);
     if (S->cs) cudaStreamDestroy(S->cs); if (S->cm) cudaStreamDestroy(S->cm);
     gemm_destroy(&S->gemm);
     cudaFree(S->hidden); cudaFree(S->normed); cudaFree(S->arena); cudaFree(S->d_deq); cudaFree(S->d_qstage);
@@ -310,9 +366,11 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
     if (stream_out) fputc('\n', stdout);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
     if (n_gen > 1) printf("%.2f tokens/s decode\n", (n_gen-1)/secs);
-    if (S.exp_total > 0)
-        printf("active-expert streaming: %ld / %ld expert-loads (%.1f%% of dense), %d/%d used/layer\n",
-               S.exp_streamed, S.exp_total, 100.0 * S.exp_streamed / S.exp_total, m.mcfg.n_used, m.mcfg.n_experts);
+    long uses = S.cache.hits + S.cache.misses;
+    long dense = (long)m.n_layers * m.mcfg.n_experts * n_gen;   // all experts, every forward
+    if (uses > 0)
+        printf("hot-expert cache: %ld/%ld hits (%.1f%%), %ld experts streamed (%.1f%% of %ld dense loads)\n",
+               S.cache.hits, uses, 100.0*S.cache.hits/uses, S.cache.misses, 100.0*S.cache.misses/dense, dense);
 
     moe_session_free(&S); free_moe_model(&m);
     return true;
