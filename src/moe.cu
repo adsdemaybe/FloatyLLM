@@ -136,6 +136,9 @@ int moe_attn_route(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayer
     // preserved for the caller's moe_experts_out (survives expert streaming). ---
     rmsnorm(hidden, w.ffn_norm, s.xn, n_new, dim, cfg.eps, stream);
     if (mcfg.n_experts == 1) {                 // dense: no router, always expert 0 weight 1.0
+        // Drain the compute stream's attn-streaming (shared d_qstage) before the caller
+        // streams the FFN on the copy stream -- mirrors the router-copy sync in the MoE path.
+        cudaStreamSynchronize(stream);
         moe_route_ones(ms.route_w, n_new, stream);
         active[0] = 0; return 1;
     }
