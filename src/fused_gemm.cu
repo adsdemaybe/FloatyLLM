@@ -48,8 +48,11 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
 }
 
 // Q4_K super-block: __half d, dmin; uint8_t scales[12]; uint8_t qs[128]. 144 B / 256 vals.
-// Warp per (row, token); the 32 lanes cooperate on ONE super-block at a time (lane l
-// handles element l of each 32-value slice) so weight/activation reads coalesce.
+// Warp per (row, token). The warp splits into 4 lane-groups of 8 (g = lane/8 = which
+// 64-value sub-block); within a group each lane reads a uint32 (4 qs bytes) so the whole
+// warp reads the 128-byte qs region in ONE coalesced transaction (vs 4 byte-reads).
+// Each lane then does 8 products (4 low-nibble + 4 high-nibble elements). Lifts K-quant
+// GEMV toward the Q8_0 bandwidth (byte-at-a-time unpack was transaction-bound < DRAM peak).
 __global__ void gemv_q4_K_kernel(const uint8_t* W, const __half* x, __half* y,
                                  int m, int n_out, int n_in) {
     int lane = threadIdx.x & (WARP - 1);
@@ -59,24 +62,24 @@ __global__ void gemv_q4_K_kernel(const uint8_t* W, const __half* x, __half* y,
     int nsb = n_in / 256;
     const uint8_t* wrow = W + (size_t)o * nsb * 144;
     const __half* xt = x + (size_t)tok * n_in;
+    int g = lane >> 3;          // 0..3 : which 64-value sub-block
+    int bl = (lane & 7) * 4;    // 0,4,..28 : byte offset within the sub-block's 32 qs bytes
     float acc = 0.0f;
     for (int sb = 0; sb < nsb; ++sb) {
         const uint8_t* blk = wrow + (size_t)sb * 144;
         float d = __half2float(*(const __half*)blk);
         float dmin = __half2float(*(const __half*)(blk + 2));
         const uint8_t* scales = blk + 4;
-        const uint8_t* qs = blk + 16;               // 128 bytes: 4 sub-blocks of 32
-        const __half* xb = xt + (size_t)sb * 256;
+        const __half* xb = xt + (size_t)sb * 256 + g * 64;   // this sub-block's 64 activations
+        uint8_t sc, mn;
+        get_scale_min_k4(g * 2 + 0, scales, &sc, &mn); float d1 = d * sc, m1 = dmin * mn;
+        get_scale_min_k4(g * 2 + 1, scales, &sc, &mn); float d2 = d * sc, m2 = dmin * mn;
+        uint32_t u = *(const uint32_t*)(blk + 16 + g * 32 + bl);
         #pragma unroll
-        for (int jj = 0; jj < 4; ++jj) {
-            uint8_t sc, mn;
-            get_scale_min_k4(jj * 2 + 0, scales, &sc, &mn); float d1 = d * sc, m1 = dmin * mn;
-            get_scale_min_k4(jj * 2 + 1, scales, &sc, &mn); float d2 = d * sc, m2 = dmin * mn;
-            uint8_t q = qs[jj * 32 + lane];
-            float vlo = d1 * (float)(q & 0xF) - m1;
-            float vhi = d2 * (float)(q >> 4)  - m2;
-            acc += vlo * __half2float(xb[jj * 64 + lane]);
-            acc += vhi * __half2float(xb[jj * 64 + 32 + lane]);
+        for (int k = 0; k < 4; ++k) {
+            uint8_t q = (u >> (8 * k)) & 0xFF;
+            acc += (d1 * (float)(q & 0xF) - m1) * __half2float(xb[bl + k]);
+            acc += (d2 * (float)(q >> 4)  - m2) * __half2float(xb[bl + 32 + k]);
         }
     }
     acc = warp_reduce(acc);
