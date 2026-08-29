@@ -24,6 +24,7 @@ struct MatRef {
     size_t quant_bytes;   // bytes to copy
     size_t arena_off;     // fp16 element offset in the layer arena
     bool is_norm;         // norms are 1D (no transpose)
+    int expert;           // expert id if an expert matrix, else -1 (attn/router/norm)
 };
 
 struct LoadedMoeModel {
