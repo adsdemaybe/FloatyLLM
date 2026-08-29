@@ -51,6 +51,17 @@ __global__ void zero_kernel(__half* p, int n) {
     if (i < n) p[i] = __float2half(0.0f);
 }
 
+__global__ void ones_f32_kernel(float* p, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 1.0f;
+}
+
+// Dense (single-expert) routing: every token uses expert 0 with weight 1.0.
+void moe_route_ones(float* route_w, int n, cudaStream_t stream) {
+    int t = 128;
+    ones_f32_kernel<<<(n + t - 1) / t, t, 0, stream>>>(route_w, n);
+}
+
 __global__ void silu_mul_kernel(__half* gate, const __half* up, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -124,6 +135,13 @@ int moe_attn_route(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayer
     // --- router: ffn_norm(-> s.xn) then top-k gate. s.xn is the expert-block input,
     // preserved for the caller's moe_experts_out (survives expert streaming). ---
     rmsnorm(hidden, w.ffn_norm, s.xn, n_new, dim, cfg.eps, stream);
+    if (mcfg.n_experts == 1) {                 // dense: no router, always expert 0 weight 1.0
+        // Drain the compute stream's attn-streaming (shared d_qstage) before the caller
+        // streams the FFN on the copy stream -- mirrors the router-copy sync in the MoE path.
+        cudaStreamSynchronize(stream);
+        moe_route_ones(ms.route_w, n_new, stream);
+        active[0] = 0; return 1;
+    }
     moe_router(gemm, s.xn, w.w_gate, ms.logits, ms.route_w, n_new, dim,
                mcfg.n_experts, mcfg.n_used, stream);
     // Pick the active experts (any token routed to them). For decode (n_new=1) this is
