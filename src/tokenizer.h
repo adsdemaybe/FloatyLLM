@@ -1,5 +1,5 @@
 // Tokenizer: thin wrapper over llama.cpp's vocab (libllama), loaded VOCAB-ONLY from the
-// GGUF (no weights) so it stays off SemiLLM's streaming path. Gives exact, maintained
+// GGUF (no weights) so it stays off FloatyLLM's streaming path. Gives exact, maintained
 // encode/decode for every tokenizer llama.cpp supports (SPM, BPE, ...). Built only when
 // configured with -DSEMILLM_LLAMA_DIR=<path to a built llama.cpp>; otherwise the calls
 // return an error so the rest of the project still builds (e.g. CI without llama.cpp).

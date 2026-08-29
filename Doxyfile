@@ -1,8 +1,8 @@
-# Doxygen config for SemiLLM call/dependency graph generation (CUDA-aware).
+# Doxygen config for FloatyLLM call/dependency graph generation (CUDA-aware).
 # Only non-default settings are set; Doxygen fills the rest.
 # Generate with: tools/codegraph.sh   (needs doxygen + graphviz)
 
-PROJECT_NAME      = "SemiLLM"
+PROJECT_NAME      = "FloatyLLM"
 OUTPUT_DIRECTORY  = build/codegraph
 INPUT             = src
 RECURSIVE         = YES

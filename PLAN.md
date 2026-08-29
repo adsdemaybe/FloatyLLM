@@ -1,4 +1,4 @@
-# SemiLLM — Latency-Hidden Mixed-Precision Streaming Inference (CUDA)
+# FloatyLLM — Latency-Hidden Mixed-Precision Streaming Inference (CUDA)
 
 ## 1. Context & thesis
 Run models larger than VRAM by streaming transformer layers CPU→GPU. Bottleneck = PCIe

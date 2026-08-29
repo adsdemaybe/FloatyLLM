@@ -1,4 +1,4 @@
-// SemiLLM CLI: load a GGUF dense model and greedily generate tokens via the
+// FloatyLLM CLI: load a GGUF dense model and greedily generate tokens via the
 // streamed forward. usage: semillm <model.gguf> <n_generate> <tok0> [tok1 ...]
 // Prints the generated token ids (detokenize with llama.cpp) + tokens/s + VRAM.
 #include "weights.h"
@@ -66,7 +66,7 @@ static int cmd_run(int argc, char** argv) {
     MoeSession S;
     if (!moe_session_init(m, ctx, budget, &S, &err)) { printf("session: %s\n", err.c_str()); return 1; }
 
-    printf("\n  SemiLLM · %s · %d experts (%d used) · %d layers · %.0f GB fp16 streamed from disk\n",
+    printf("\n  FloatyLLM · %s · %d experts (%d used) · %d layers · %.0f GB fp16 streamed from disk\n",
            m.arch.c_str(), m.mcfg.n_experts, m.mcfg.n_used, m.n_layers, m.blob.total_elems * 2.0 / 1e9 * m.n_layers);
     printf("  ctx=%d  budget=%.0f GB  temp=%.2f%s\n", ctx, budget, temp,
            interactive ? "   (/bye to exit, /reset to clear context)" : "");
