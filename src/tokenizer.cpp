@@ -51,6 +51,12 @@ std::string tokenizer_apply_chat(const Tokenizer& t,
                                  bool add_assistant) {
     if (!t.ok) return "";
     const char* tmpl = llama_model_chat_template(t.model, nullptr);   // model's built-in template
+    // Base models (e.g. Llama-2-70B, not -chat) ship NO chat template. Passing null to
+    // llama_chat_apply_template makes llama.cpp default to ChatML (<|im_start|>/<|im_end|>),
+    // whose end token is not in the Llama vocab -> the model emits it as literal text and
+    // never stops (runaway fake turns). Return "" so chat_repl falls back to raw text
+    // completion, where the model's real EOS (</s>) terminates generation.
+    if (!tmpl || !*tmpl) return "";
     std::vector<llama_chat_message> chat(msgs.size());
     for (size_t i = 0; i < msgs.size(); ++i) { chat[i].role = msgs[i].first.c_str(); chat[i].content = msgs[i].second.c_str(); }
     std::vector<char> buf(4096);
