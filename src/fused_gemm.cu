@@ -85,6 +85,87 @@ __global__ void gemv_q4_K_kernel(const uint8_t* W, const __half* x, __half* y,
     acc = warp_reduce(acc);
     if (lane == 0) y[(size_t)tok * n_out + o] = __float2half(acc);
 }
+
+// Q5_K super-block: __half d, dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128].
+// 176 B / 256 vals. 5th bit per weight from qh; per-64 sub-block scale/min via
+// get_scale_min_k4. Warp per (row, token); each lane strides over 256-val super-blocks
+// and dots the whole block (mirrors dequant_q5_K, multiply-accumulate against x).
+__global__ void gemv_q5_K_kernel(const uint8_t* W, const __half* x, __half* y,
+                                 int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1);
+    int o = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    int tok = blockIdx.y;
+    if (o >= n_out || tok >= m) return;
+    int nsb = n_in / 256;
+    const uint8_t* wrow = W + (size_t)o * nsb * 176;
+    const __half* xt = x + (size_t)tok * n_in;
+    float acc = 0.0f;
+    for (int sb = lane; sb < nsb; sb += WARP) {
+        const uint8_t* blk = wrow + (size_t)sb * 176;
+        float d = __half2float(*(const __half*)blk);
+        float dmin = __half2float(*(const __half*)(blk + 2));
+        const uint8_t* scales = blk + 4;
+        const uint8_t* qh = blk + 16;
+        const uint8_t* ql = blk + 48;
+        const __half* xb = xt + (size_t)sb * 256;
+        int is = 0; uint8_t u1 = 1, u2 = 2; int base = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, mn;
+            get_scale_min_k4(is + 0, scales, &sc, &mn); float d1 = d * sc, m1 = dmin * mn;
+            get_scale_min_k4(is + 1, scales, &sc, &mn); float d2 = d * sc, m2 = dmin * mn;
+            for (int l = 0; l < 32; ++l) {
+                float vlo = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+                float vhi = d2 * (float)((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2;
+                acc += vlo * __half2float(xb[base + l]);
+                acc += vhi * __half2float(xb[base + l + 32]);
+            }
+            ql += 32; is += 2; u1 <<= 2; u2 <<= 2; base += 64;
+        }
+    }
+    acc = warp_reduce(acc);
+    if (lane == 0) y[(size_t)tok * n_out + o] = __float2half(acc);
+}
+
+// Q6_K super-block: ql[128], qh[64], int8 scales[16], __half d. 210 B / 256 vals.
+// Signed 6-bit q = (ql_nib | (qh_2b<<4)) - 32; x = d*scale[sub]*q. Warp per (row,
+// token); lane strides super-blocks, dots the whole block (mirrors dequant_q6_K).
+__global__ void gemv_q6_K_kernel(const uint8_t* W, const __half* x, __half* y,
+                                 int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1);
+    int o = blockIdx.x * WARPS + (threadIdx.x >> 5);
+    int tok = blockIdx.y;
+    if (o >= n_out || tok >= m) return;
+    int nsb = n_in / 256;
+    const uint8_t* wrow = W + (size_t)o * nsb * 210;
+    const __half* xt = x + (size_t)tok * n_in;
+    float acc = 0.0f;
+    for (int sb = lane; sb < nsb; sb += WARP) {
+        const uint8_t* blk = wrow + (size_t)sb * 210;
+        const uint8_t* ql = blk;
+        const uint8_t* qh = blk + 128;
+        const int8_t* sc = (const int8_t*)(blk + 192);
+        float d = __half2float(*(const __half*)(blk + 208));
+        const __half* xb = xt + (size_t)sb * 256;
+        for (int nn = 0; nn < 256; nn += 128) {
+            const uint8_t* Ql = ql + (nn / 128) * 64;
+            const uint8_t* Qh = qh + (nn / 128) * 32;
+            const int8_t* Sc = sc + (nn / 128) * 8;
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int q1 = (int)((Ql[l + 0] & 0xF) | (((Qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((Ql[l + 32] & 0xF) | (((Qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((Ql[l + 0] >> 4)  | (((Qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((Ql[l + 32] >> 4) | (((Qh[l] >> 6) & 3) << 4)) - 32;
+                acc += d * Sc[is + 0] * q1 * __half2float(xb[nn + l + 0]);
+                acc += d * Sc[is + 2] * q2 * __half2float(xb[nn + l + 32]);
+                acc += d * Sc[is + 4] * q3 * __half2float(xb[nn + l + 64]);
+                acc += d * Sc[is + 6] * q4 * __half2float(xb[nn + l + 96]);
+            }
+        }
+    }
+    acc = warp_reduce(acc);
+    if (lane == 0) y[(size_t)tok * n_out + o] = __float2half(acc);
+}
 }  // namespace
 
 void fused_gemv_q8_0(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream) {
@@ -99,11 +180,25 @@ void fused_gemv_q4_K(const uint8_t* W, const __half* x, __half* y, int m, int n_
     gemv_q4_K_kernel<<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in);
 }
 
+void fused_gemv_q5_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream) {
+    if (m <= 0 || n_out <= 0 || n_in <= 0) return;
+    dim3 grid((n_out + WARPS - 1) / WARPS, m);
+    gemv_q5_K_kernel<<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in);
+}
+
+void fused_gemv_q6_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream) {
+    if (m <= 0 || n_out <= 0 || n_in <= 0) return;
+    dim3 grid((n_out + WARPS - 1) / WARPS, m);
+    gemv_q6_K_kernel<<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in);
+}
+
 bool fused_gemv(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in,
                 uint32_t ggml_type, cudaStream_t stream) {
     switch (ggml_type) {
         case 8:  fused_gemv_q8_0(W, x, y, m, n_out, n_in, stream); return true;   // Q8_0
         case 12: fused_gemv_q4_K(W, x, y, m, n_out, n_in, stream); return true;   // Q4_K
+        case 13: fused_gemv_q5_K(W, x, y, m, n_out, n_in, stream); return true;   // Q5_K
+        case 14: fused_gemv_q6_K(W, x, y, m, n_out, n_in, stream); return true;   // Q6_K
         default: return false;
     }
 }

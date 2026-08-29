@@ -13,6 +13,8 @@
 // One CUDA block per (output row, token); threads reduce over n_in.
 void fused_gemv_q8_0(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream);
 void fused_gemv_q4_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream);
+void fused_gemv_q5_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream);
+void fused_gemv_q6_K(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream);
 
 // Dispatch by ggml type; returns false if the type has no fused kernel yet (caller
 // falls back to dequant + cuBLAS).
