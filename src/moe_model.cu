@@ -272,27 +272,33 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
         for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) session_stream_mat(S, mr, S.cm);   // attn + router
         int na = moe_attn_route(cfg, mc, S.w, S.hidden, S.positions, n_new, L, len_before, S.kv, S.s, S.ms, &S.gemm, S.cm, active, 256);
         moe_mlp_zero(S.ms.moe_out, n_new*dim, S.cm);
-        // Resolve each active expert against the cache; stream ONLY the misses on cs.
-        for (int a=0; a<na; ++a) {
-            int e = active[a]; bool hit;
-            int slot = cache_slot(c, L, e, &hit); slot_of[a] = slot; miss[a] = !hit;
-            __half* base = c.pool + (size_t)slot * c.stride;
-            S.wg[e] = base; S.wu[e] = base + m.blob.off_eup; S.wd[e] = base + m.blob.off_edown;
-            if (!hit) {
-                cudaStreamWaitEvent(S.cs, c.slot_evt[slot], 0);   // prior reader of this slot done
-                size_t eb = m.blob.off_experts + (size_t)e * m.blob.expert_stride;
-                for (const MatRef& mr : m.layers[L]) if (mr.expert == e)
-                    session_stream_to(S, mr, base + (mr.arena_off - eb), S.cs);
-                cudaEventRecord(S.ev[a], S.cs);                   // copy done
-                S.exp_streamed += 1;
+        // Process active experts in WAVES of per_layer: each wave's experts get distinct
+        // cache slots (needed since the whole wave is resident during its compute), so na
+        // may exceed per_layer (prefill routes many) without corrupting slots. Decode
+        // (na <= n_used <= per_layer) is a single wave. Stream misses on cs, compute on cm.
+        for (int w0 = 0; w0 < na; w0 += c.per_layer) {
+            int wn = (na - w0 < c.per_layer) ? na - w0 : c.per_layer;
+            for (int j = 0; j < wn; ++j) {
+                int a = w0 + j, e = active[a]; bool hit;
+                int slot = cache_slot(c, L, e, &hit); slot_of[a] = slot; miss[a] = !hit;
+                __half* base = c.pool + (size_t)slot * c.stride;
+                S.wg[e] = base; S.wu[e] = base + m.blob.off_eup; S.wd[e] = base + m.blob.off_edown;
+                if (!hit) {
+                    cudaStreamWaitEvent(S.cs, c.slot_evt[slot], 0);   // prior reader of this slot done
+                    size_t eb = m.blob.off_experts + (size_t)e * m.blob.expert_stride;
+                    for (const MatRef& mr : m.layers[L]) if (mr.expert == e)
+                        session_stream_to(S, mr, base + (mr.arena_off - eb), S.cs);
+                    cudaEventRecord(S.ev[j], S.cs);                   // copy done
+                    S.exp_streamed += 1;
+                }
             }
-        }
-        for (int a=0; a<na; ++a) {                               // compute on cm, overlapped with cs
-            int e = active[a];
-            if (miss[a]) cudaStreamWaitEvent(S.cm, S.ev[a], 0);
-            moe_mlp_one(&S.gemm, S.s.xn, S.wg[e], S.wu[e], S.wd[e], S.ms.route_w,
-                        S.ms.moe_out, S.ms.gate, S.ms.up, S.ms.ye, n_new, dim, ef, e, E, S.cm);
-            cudaEventRecord(c.slot_evt[slot_of[a]], S.cm);        // this slot's read is done
+            for (int j = 0; j < wn; ++j) {
+                int a = w0 + j, e = active[a];
+                if (miss[a]) cudaStreamWaitEvent(S.cm, S.ev[j], 0);
+                moe_mlp_one(&S.gemm, S.s.xn, S.wg[e], S.wu[e], S.wd[e], S.ms.route_w,
+                            S.ms.moe_out, S.ms.gate, S.ms.up, S.ms.ye, n_new, dim, ef, e, E, S.cm);
+                cudaEventRecord(c.slot_evt[slot_of[a]], S.cm);        // this slot's read is done
+            }
         }
         moe_experts_tail(cfg, mc, S.w, S.hidden, n_new, S.s, S.ms, &S.gemm, S.cm);
         S.exp_total += na;
