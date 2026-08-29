@@ -74,7 +74,7 @@ struct MoeSession {
     int max_T = 0, len = 0;                 // len = tokens already in the KV cache
     double budget_gb = 0;
     __half *hidden = nullptr, *normed = nullptr, *arena = nullptr, *d_deq = nullptr, *logits_d = nullptr;
-    uint8_t* d_qstage = nullptr; int* positions = nullptr; int* d_ids = nullptr;
+    uint8_t* d_qstage = nullptr; int* positions = nullptr; int* d_ids = nullptr; int* d_arg = nullptr;
     LayerScratch s{}; MoeScratch ms{}; KVCache kv{};
     std::vector<const __half*> wg, wu, wd; MoeLayerWeights w{};   // per-layer active-expert ptrs
     ExpertCache cache;
