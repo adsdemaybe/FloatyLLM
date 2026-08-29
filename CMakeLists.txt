@@ -90,3 +90,7 @@ add_test(NAME moe_layer COMMAND test_moe_layer)
 add_executable(test_kquant_gpu tests/test_kquant_gpu.cu)
 target_link_libraries(test_kquant_gpu PRIVATE semillm_core)
 add_test(NAME kquant_gpu COMMAND test_kquant_gpu)
+
+add_executable(test_fused_gemm tests/test_fused_gemm.cu)
+target_link_libraries(test_fused_gemm PRIVATE semillm_core)
+add_test(NAME fused_gemm COMMAND test_fused_gemm)
