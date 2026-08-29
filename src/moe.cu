@@ -66,20 +66,35 @@ void moe_router(Gemm* g, const __half* x, const __half* w_gate, __half* logits_T
     router_topk_kernel<<<(T + t - 1) / t, t, 0, stream>>>(logits_TE, route_w, T, n_experts, topk);
 }
 
+void moe_mlp_zero(__half* out, int n, cudaStream_t stream) {
+    int t = 256;
+    zero_kernel<<<(n + t - 1) / t, t, 0, stream>>>(out, n);
+}
+
+// One expert's SwiGLU: out[t,:] += route_w[t,e] * down_e(silu(gate_e(x)) * up_e(x)).
+// Reads wgate_e/wup_e/wdown_e (that expert's slot); does NOT zero out (caller does once).
+void moe_mlp_one(Gemm* g, const __half* x, const __half* wgate_e, const __half* wup_e,
+                 const __half* wdown_e, const float* route_w, __half* out, __half* gate,
+                 __half* up, __half* ye, int T, int dim, int ffn, int e, int n_experts,
+                 cudaStream_t stream) {
+    int td = T * dim, tf = T * ffn, t = 256;
+    gemm_rowmajor(g, x, wgate_e, gate, T, ffn, dim, stream);
+    gemm_rowmajor(g, x, wup_e, up, T, ffn, dim, stream);
+    silu_mul_kernel<<<(tf + t - 1) / t, t, 0, stream>>>(gate, up, tf);
+    gemm_rowmajor(g, gate, wdown_e, ye, T, dim, ffn, stream);
+    scale_accumulate_kernel<<<(td + t - 1) / t, t, 0, stream>>>(out, ye, route_w, e, n_experts, T, dim);
+}
+
 void moe_mlp(Gemm* g, const __half* x, const __half* const* wgate,
              const __half* const* wup, const __half* const* wdown,
              const float* route_w, __half* out, __half* gate, __half* up, __half* ye,
              int T, int dim, int ffn, int n_experts, const int* active, int n_active,
              cudaStream_t stream) {
-    int td = T * dim, tf = T * ffn, t = 256;
-    zero_kernel<<<(td + t - 1) / t, t, 0, stream>>>(out, td);
+    moe_mlp_zero(out, T * dim, stream);
     for (int a = 0; a < n_active; ++a) {
         int e = active[a];
-        gemm_rowmajor(g, x, wgate[e], gate, T, ffn, dim, stream);
-        gemm_rowmajor(g, x, wup[e], up, T, ffn, dim, stream);
-        silu_mul_kernel<<<(tf + t - 1) / t, t, 0, stream>>>(gate, up, tf);
-        gemm_rowmajor(g, gate, wdown[e], ye, T, dim, ffn, stream);
-        scale_accumulate_kernel<<<(td + t - 1) / t, t, 0, stream>>>(out, ye, route_w, e, n_experts, T, dim);
+        moe_mlp_one(g, x, wgate[e], wup[e], wdown[e], route_w, out, gate, up, ye,
+                    T, dim, ffn, e, n_experts, stream);
     }
 }
 
@@ -125,14 +140,12 @@ int moe_attn_route(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayer
     return n_active;
 }
 
-void moe_experts_out(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
-                     __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
-                     cudaStream_t stream, const int* active, int n_active) {
+// Shared expert (if any) added to ms.moe_out, then hidden += moe_out. Call after the
+// routed experts have accumulated into ms.moe_out.
+void moe_experts_tail(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                      __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
+                      cudaStream_t stream) {
     int dim = cfg.dim;
-    moe_mlp(gemm, s.xn, w.wgate, w.wup, w.wdown, ms.route_w, ms.moe_out,
-            ms.gate, ms.up, ms.ye, n_new, dim, mcfg.expert_ffn, mcfg.n_experts, active, n_active, stream);
-
-    // Optional shared expert: always-on SwiGLU added to the routed sum.
     if (mcfg.has_shared && w.sh_gate) {
         gemm_rowmajor(gemm, s.xn, w.sh_gate, ms.gate, n_new, mcfg.expert_ffn, dim, stream);
         gemm_rowmajor(gemm, s.xn, w.sh_up, ms.up, n_new, mcfg.expert_ffn, dim, stream);
@@ -142,6 +155,14 @@ void moe_experts_out(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLay
         residual_add(ms.moe_out, ms.ye, n_new * dim, stream);
     }
     residual_add(hidden, ms.moe_out, n_new * dim, stream);
+}
+
+void moe_experts_out(const LlamaConfig& cfg, const MoeConfig& mcfg, const MoeLayerWeights& w,
+                     __half* hidden, int n_new, LayerScratch& s, MoeScratch& ms, Gemm* gemm,
+                     cudaStream_t stream, const int* active, int n_active) {
+    moe_mlp(gemm, s.xn, w.wgate, w.wup, w.wdown, ms.route_w, ms.moe_out,
+            ms.gate, ms.up, ms.ye, n_new, cfg.dim, mcfg.expert_ffn, mcfg.n_experts, active, n_active, stream);
+    moe_experts_tail(cfg, mcfg, w, hidden, n_new, s, ms, gemm, stream);
 }
 
 // Convenience wrapper (all experts resident): route then run. Streaming callers use
