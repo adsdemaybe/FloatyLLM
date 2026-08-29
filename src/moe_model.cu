@@ -174,101 +174,125 @@ void free_moe_model(LoadedMoeModel* m) {
     m->rw.token_embd = nullptr;
 }
 
-bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double budget_gb, std::string* err) {
+// Stream one weight matrix (DMA quant -> GPU dequant -> transpose into the arena) on `st`.
+static void session_stream_mat(MoeSession& S, const MatRef& mr, cudaStream_t st) {
+    cudaMemcpyAsync(S.d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, st);
+    if (mr.is_norm) dequant_to_fp16(S.d_qstage, S.arena + mr.arena_off, mr.type, mr.n_elems, st);
+    else { dequant_to_fp16(S.d_qstage, S.d_deq, mr.type, mr.n_elems, st);
+           transpose_fp16(S.d_deq, S.arena + mr.arena_off, mr.out, mr.in, st); }
+}
+
+bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession* S, std::string* err) {
     const LlamaConfig& cfg = m.cfg; const MoeConfig& mc = m.mcfg;
     int dim = cfg.dim, qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ef = mc.expert_ffn, E = mc.n_experts;
-    int prompt_len = (int)ids.size(), max_T = prompt_len + n_gen;
     size_t per = m.blob.total_elems;
+    S->m = &m; S->max_T = max_T; S->budget_gb = budget_gb; S->len = 0;
 
-    __half *hidden, *normed, *arena, *d_deq, *logits_d; uint8_t* d_qstage; int* positions;
-    cudaMalloc(&hidden,(size_t)max_T*dim*2); cudaMalloc(&normed,(size_t)max_T*dim*2);
-    cudaMalloc(&arena, per*2); cudaMalloc(&d_deq, m.max_elems*2); cudaMalloc(&d_qstage, m.max_quant_bytes);
-    cudaMalloc(&logits_d,(size_t)m.vocab*2); cudaMalloc(&positions, max_T*4);
-    LayerScratch s;
-    cudaMalloc(&s.xn,(size_t)max_T*dim*2); cudaMalloc(&s.q,(size_t)max_T*qd*2); cudaMalloc(&s.k,(size_t)max_T*kvd*2);
-    cudaMalloc(&s.v,(size_t)max_T*kvd*2); cudaMalloc(&s.att,(size_t)max_T*qd*2); cudaMalloc(&s.proj,(size_t)max_T*dim*2);
-    cudaMalloc(&s.gate,(size_t)max_T*ef*2); cudaMalloc(&s.up,(size_t)max_T*ef*2);
-    MoeScratch ms;
-    cudaMalloc(&ms.logits,(size_t)max_T*E*2); cudaMalloc(&ms.route_w,(size_t)max_T*E*sizeof(float));
-    cudaMalloc(&ms.gate,(size_t)max_T*ef*2); cudaMalloc(&ms.up,(size_t)max_T*ef*2);
-    cudaMalloc(&ms.ye,(size_t)max_T*dim*2); cudaMalloc(&ms.moe_out,(size_t)max_T*dim*2);
-    cudaHostAlloc((void**)&ms.h_route,(size_t)max_T*E*sizeof(float), cudaHostAllocDefault);
-    KVCache kv; kv.n_layers=m.n_layers; kv.max_T=max_T; kv.kvd=kvd; kv.len=0;
-    cudaMalloc(&kv.K,(size_t)m.n_layers*max_T*kvd*2); cudaMalloc(&kv.V,(size_t)m.n_layers*max_T*kvd*2);
+    cudaMalloc(&S->hidden,(size_t)max_T*dim*2); cudaMalloc(&S->normed,(size_t)max_T*dim*2);
+    cudaMalloc(&S->arena, per*2); cudaMalloc(&S->d_deq, m.max_elems*2); cudaMalloc(&S->d_qstage, m.max_quant_bytes);
+    cudaMalloc(&S->logits_d,(size_t)m.vocab*2); cudaMalloc(&S->positions, max_T*4);
+    cudaMalloc(&S->s.xn,(size_t)max_T*dim*2); cudaMalloc(&S->s.q,(size_t)max_T*qd*2); cudaMalloc(&S->s.k,(size_t)max_T*kvd*2);
+    cudaMalloc(&S->s.v,(size_t)max_T*kvd*2); cudaMalloc(&S->s.att,(size_t)max_T*qd*2); cudaMalloc(&S->s.proj,(size_t)max_T*dim*2);
+    cudaMalloc(&S->s.gate,(size_t)max_T*ef*2); cudaMalloc(&S->s.up,(size_t)max_T*ef*2);
+    cudaMalloc(&S->ms.logits,(size_t)max_T*E*2); cudaMalloc(&S->ms.route_w,(size_t)max_T*E*sizeof(float));
+    cudaMalloc(&S->ms.gate,(size_t)max_T*ef*2); cudaMalloc(&S->ms.up,(size_t)max_T*ef*2);
+    cudaMalloc(&S->ms.ye,(size_t)max_T*dim*2); cudaMalloc(&S->ms.moe_out,(size_t)max_T*dim*2);
+    cudaHostAlloc((void**)&S->ms.h_route,(size_t)max_T*E*sizeof(float), cudaHostAllocDefault);
+    S->kv.n_layers=m.n_layers; S->kv.max_T=max_T; S->kv.kvd=kvd; S->kv.len=0;
+    cudaMalloc(&S->kv.K,(size_t)m.n_layers*max_T*kvd*2); cudaMalloc(&S->kv.V,(size_t)m.n_layers*max_T*kvd*2);
 
     double arena_gb = per*2/1e9;
-    int K = budget_gb > 0 ? (int)(budget_gb / arena_gb) : 1;
-    if (K < 1) K = 1;
+    int K = budget_gb > 0 ? (int)(budget_gb / arena_gb) : 1; if (K < 1) K = 1;
     printf("per-layer arena=%.2f GB, budget=%.1f GB -> up to K=%d layers fit (streaming 1 at a time)\n",
            arena_gb, budget_gb, K);
 
-    std::vector<const __half*> wg(E), wu(E), wd(E);
+    S->wg.resize(E); S->wu.resize(E); S->wd.resize(E);
     for (int e=0;e<E;++e){ size_t eb=m.blob.off_experts+(size_t)e*m.blob.expert_stride;
-        wg[e]=arena+eb+m.blob.off_egate; wu[e]=arena+eb+m.blob.off_eup; wd[e]=arena+eb+m.blob.off_edown; }
-    MoeLayerWeights w;
-    w.attn_norm=arena+m.blob.off_attn_norm; w.wq=arena+m.blob.off_wq; w.wk=arena+m.blob.off_wk; w.wv=arena+m.blob.off_wv;
-    w.wo=arena+m.blob.off_wo; w.ffn_norm=arena+m.blob.off_ffn_norm; w.w_gate=arena+m.blob.off_router;
-    w.wgate=wg.data(); w.wup=wu.data(); w.wdown=wd.data();
+        S->wg[e]=S->arena+eb+m.blob.off_egate; S->wu[e]=S->arena+eb+m.blob.off_eup; S->wd[e]=S->arena+eb+m.blob.off_edown; }
+    S->w.attn_norm=S->arena+m.blob.off_attn_norm; S->w.wq=S->arena+m.blob.off_wq; S->w.wk=S->arena+m.blob.off_wk;
+    S->w.wv=S->arena+m.blob.off_wv; S->w.wo=S->arena+m.blob.off_wo; S->w.ffn_norm=S->arena+m.blob.off_ffn_norm;
+    S->w.w_gate=S->arena+m.blob.off_router; S->w.wgate=S->wg.data(); S->w.wup=S->wu.data(); S->w.wdown=S->wd.data();
 
-    int* d_ids; cudaMalloc(&d_ids, max_T*4);
-    // cm = compute stream, cs = copy stream. Expert weights prefetch on cs while cm
-    // computes the previous expert; a per-expert event orders each compute after its copy.
-    cudaStream_t cm, cs; cudaStreamCreate(&cm); cudaStreamCreate(&cs);
-    std::vector<cudaEvent_t> ev(E);
-    for (int e=0;e<E;++e) cudaEventCreateWithFlags(&ev[e], cudaEventDisableTiming);
-    Gemm gemm; gemm_create(&gemm);
-    std::vector<__half> hl(m.vocab); std::vector<float> lf(m.vocab);
+    cudaMalloc(&S->d_ids, max_T*4);
+    cudaStreamCreate(&S->cm); cudaStreamCreate(&S->cs);
+    S->ev.resize(E); for (int e=0;e<E;++e) cudaEventCreateWithFlags(&S->ev[e], cudaEventDisableTiming);
+    gemm_create(&S->gemm);
+    S->hl.resize(m.vocab); S->lf.resize(m.vocab);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { if (err) *err = std::string("session_init: ") + cudaGetErrorString(e); return false; }
+    return true;
+}
 
-    auto stream_mat = [&](const MatRef& mr, cudaStream_t st) {
-        cudaMemcpyAsync(d_qstage, mr.src, mr.quant_bytes, cudaMemcpyHostToDevice, st);
-        if (mr.is_norm) dequant_to_fp16(d_qstage, arena + mr.arena_off, mr.type, mr.n_elems, st);
-        else { dequant_to_fp16(d_qstage, d_deq, mr.type, mr.n_elems, st);
-               transpose_fp16(d_deq, arena + mr.arena_off, mr.out, mr.in, st); }
-    };
-    // Active-expert streaming (PLAN sec 16) + copy/compute overlap: stream attn + router,
-    // route, then prefetch ONLY the selected experts on cs while cm computes them.
-    long exp_streamed = 0, exp_total = 0;
-    auto forward = [&](const int* d_tok, int n_new, int len_before) {
-        std::vector<int> pos(n_new); for (int i=0;i<n_new;++i) pos[i]=len_before+i;
-        cudaMemcpy(positions, pos.data(), n_new*4, cudaMemcpyHostToDevice);
-        embed_tokens(m.rw.token_embd, d_tok, hidden, n_new, dim, cm);
-        int active[256];
-        for (int L=0; L<m.n_layers; ++L) {
-            for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) stream_mat(mr, cm);   // attn + router (on cm; router syncs)
-            int na = moe_attn_route(cfg, mc, w, hidden, positions, n_new, L, len_before, kv, s, ms, &gemm, cm, active, 256);
-            moe_mlp_zero(ms.moe_out, n_new*dim, cm);
-            // Prefetch each active expert on cs (staging buffers are free: the router sync
-            // drained cm's attn streaming). Each records an event when its arena slot is ready.
-            for (int a=0; a<na; ++a) {
-                for (const MatRef& mr : m.layers[L]) if (mr.expert == active[a]) stream_mat(mr, cs);
-                cudaEventRecord(ev[a], cs);
-            }
-            // Compute expert a on cm after its copy completes; cs streams a+1.. concurrently.
-            // Waiting ev[na-1] also hands the shared staging buffers back to cm for next layer.
-            for (int a=0; a<na; ++a) {
-                cudaStreamWaitEvent(cm, ev[a], 0);
-                moe_mlp_one(&gemm, s.xn, wg[active[a]], wu[active[a]], wd[active[a]], ms.route_w,
-                            ms.moe_out, ms.gate, ms.up, ms.ye, n_new, dim, ef, active[a], E, cm);
-            }
-            moe_experts_tail(cfg, mc, w, hidden, n_new, s, ms, &gemm, cm);
-            exp_streamed += na; exp_total += E;
+bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err) {
+    LoadedMoeModel& m = *S.m; const LlamaConfig& cfg = m.cfg; const MoeConfig& mc = m.mcfg;
+    int dim = cfg.dim, ef = mc.expert_ffn, E = mc.n_experts, len_before = S.len;
+    if (S.len + n_new > S.max_T) { if (err) *err = "context length exceeded (raise --ctx)"; return false; }
+
+    cudaMemcpy(S.d_ids, ids, n_new*4, cudaMemcpyHostToDevice);
+    std::vector<int> pos(n_new); for (int i=0;i<n_new;++i) pos[i]=len_before+i;
+    cudaMemcpy(S.positions, pos.data(), n_new*4, cudaMemcpyHostToDevice);
+    embed_tokens(m.rw.token_embd, S.d_ids, S.hidden, n_new, dim, S.cm);
+    int active[256];
+    for (int L=0; L<m.n_layers; ++L) {
+        for (const MatRef& mr : m.layers[L]) if (mr.expert < 0) session_stream_mat(S, mr, S.cm);   // attn + router
+        int na = moe_attn_route(cfg, mc, S.w, S.hidden, S.positions, n_new, L, len_before, S.kv, S.s, S.ms, &S.gemm, S.cm, active, 256);
+        moe_mlp_zero(S.ms.moe_out, n_new*dim, S.cm);
+        for (int a=0; a<na; ++a) {                             // prefetch active experts on cs
+            for (const MatRef& mr : m.layers[L]) if (mr.expert == active[a]) session_stream_mat(S, mr, S.cs);
+            cudaEventRecord(S.ev[a], S.cs);
         }
-        rmsnorm(hidden, m.rw.final_norm, normed, n_new, dim, cfg.eps, cm);
-        gemm_rowmajor(&gemm, m.rw.output, normed+(size_t)(n_new-1)*dim, logits_d, m.vocab, 1, dim, cm);
-        cudaStreamSynchronize(cm);
-    };
-    auto sample = [&]() -> int {
-        cudaMemcpy(hl.data(), logits_d, m.vocab*2, cudaMemcpyDeviceToHost);
-        for (int v=0;v<m.vocab;++v) lf[v]=__half2float(hl[v]);
-        return sample_greedy(lf.data(), m.vocab);
-    };
+        for (int a=0; a<na; ++a) {                             // compute on cm, overlapped with cs
+            cudaStreamWaitEvent(S.cm, S.ev[a], 0);
+            moe_mlp_one(&S.gemm, S.s.xn, S.wg[active[a]], S.wu[active[a]], S.wd[active[a]], S.ms.route_w,
+                        S.ms.moe_out, S.ms.gate, S.ms.up, S.ms.ye, n_new, dim, ef, active[a], E, S.cm);
+        }
+        moe_experts_tail(cfg, mc, S.w, S.hidden, n_new, S.s, S.ms, &S.gemm, S.cm);
+        S.exp_streamed += na; S.exp_total += E;
+    }
+    rmsnorm(S.hidden, m.rw.final_norm, S.normed, n_new, dim, cfg.eps, S.cm);
+    gemm_rowmajor(&S.gemm, m.rw.output, S.normed+(size_t)(n_new-1)*dim, S.logits_d, m.vocab, 1, dim, S.cm);
+    cudaStreamSynchronize(S.cm);
+    S.len += n_new; S.kv.len = S.len;
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { if (err) *err = cudaGetErrorString(e); return false; }
+    return true;
+}
 
-    // Live token streaming (SEMILLM_STREAM=1): detokenize + print each token as generated.
+int moe_session_sample(MoeSession& S, float temp, float rand01) {
+    int vocab = S.m->vocab;
+    cudaMemcpy(S.hl.data(), S.logits_d, vocab*2, cudaMemcpyDeviceToHost);
+    for (int v=0;v<vocab;++v) S.lf[v]=__half2float(S.hl[v]);
+    return temp > 0.0f ? sample_temperature(S.lf.data(), vocab, temp, rand01)
+                       : sample_greedy(S.lf.data(), vocab);
+}
+
+void moe_session_reset(MoeSession& S) { S.len = 0; S.kv.len = 0; }
+
+void moe_session_free(MoeSession* S) {
+    if (!S->m) return;
+    for (auto ev : S->ev) cudaEventDestroy(ev);
+    if (S->cs) cudaStreamDestroy(S->cs); if (S->cm) cudaStreamDestroy(S->cm);
+    gemm_destroy(&S->gemm);
+    cudaFree(S->hidden); cudaFree(S->normed); cudaFree(S->arena); cudaFree(S->d_deq); cudaFree(S->d_qstage);
+    cudaFree(S->logits_d); cudaFree(S->positions); cudaFree(S->d_ids);
+    cudaFree(S->s.xn); cudaFree(S->s.q); cudaFree(S->s.k); cudaFree(S->s.v); cudaFree(S->s.att); cudaFree(S->s.proj);
+    cudaFree(S->s.gate); cudaFree(S->s.up);
+    cudaFree(S->ms.logits); cudaFree(S->ms.route_w); cudaFree(S->ms.gate); cudaFree(S->ms.up); cudaFree(S->ms.ye); cudaFree(S->ms.moe_out);
+    cudaFreeHost(S->ms.h_route);
+    cudaFree(S->kv.K); cudaFree(S->kv.V);
+    S->m = nullptr;
+}
+
+bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double budget_gb, std::string* err) {
+    int prompt_len = (int)ids.size();
+    MoeSession S;
+    if (!moe_session_init(m, prompt_len + n_gen, budget_gb, &S, err)) return false;
+
+    // Live token streaming (SEMILLM_STREAM=1) via the GGUF piece table.
     const std::vector<std::string>* toks = nullptr;
     auto tit = m.g->meta.find("tokenizer.ggml.tokens");
     if (tit != m.g->meta.end() && !tit->second.strs.empty()) toks = &tit->second.strs;
     bool stream_out = getenv("SEMILLM_STREAM") != nullptr;
-    if (stream_out && !toks) printf("(SEMILLM_STREAM set but no tokenizer.ggml.tokens in GGUF)\n");
     auto emit = [&](int id) {
         if (!stream_out || !toks || id < 0 || id >= (int)toks->size()) return;
         std::string p = sp_piece((*toks)[id]); fputs(p.c_str(), stdout); fflush(stdout);
@@ -276,25 +300,20 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen, double bu
 
     printf("prefill %d + generate %d (MoE, stream-original)...\n", prompt_len, n_gen);
     if (stream_out) { fputs("> ", stdout); for (int id : ids) emit(id); }
-    cudaMemcpy(d_ids, ids.data(), prompt_len*4, cudaMemcpyHostToDevice);
-    forward(d_ids, prompt_len, 0); kv.len = prompt_len;
-    int next = sample(); ids.push_back(next); emit(next);
+    if (!moe_session_eval(S, ids.data(), prompt_len, err)) { moe_session_free(&S); return false; }
+    int next = moe_session_sample(S, 0, 0); ids.push_back(next); emit(next);
     auto t0 = std::chrono::steady_clock::now();
     for (int step=1; step<n_gen; ++step) {
-        cudaMemcpy(d_ids, &next, 4, cudaMemcpyHostToDevice);
-        forward(d_ids, 1, kv.len); kv.len += 1; next = sample(); ids.push_back(next); emit(next);
+        if (!moe_session_eval(S, &next, 1, err)) { moe_session_free(&S); return false; }
+        next = moe_session_sample(S, 0, 0); ids.push_back(next); emit(next);
     }
     if (stream_out) fputc('\n', stdout);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { if (err) *err = cudaGetErrorString(e); return false; }
     if (n_gen > 1) printf("%.2f tokens/s decode\n", (n_gen-1)/secs);
-    if (exp_total > 0)
+    if (S.exp_total > 0)
         printf("active-expert streaming: %ld / %ld expert-loads (%.1f%% of dense), %d/%d used/layer\n",
-               exp_streamed, exp_total, 100.0 * exp_streamed / exp_total, mc.n_used, E);
+               S.exp_streamed, S.exp_total, 100.0 * S.exp_streamed / S.exp_total, m.mcfg.n_used, m.mcfg.n_experts);
 
-    for (int e=0;e<E;++e) cudaEventDestroy(ev[e]);
-    cudaStreamDestroy(cs);
-    cudaFree(kv.K); cudaFree(kv.V); gemm_destroy(&gemm); free_moe_model(&m);
+    moe_session_free(&S); free_moe_model(&m);
     return true;
 }
