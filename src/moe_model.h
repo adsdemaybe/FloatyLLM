@@ -49,15 +49,18 @@ bool moe_generate(LoadedMoeModel& m, std::vector<int>& ids, int n_gen,
                   double budget_gb, std::string* err);
 
 // Hot-expert VRAM cache (PLAN sec 16): keep recently-used experts resident (dequantized
-// fp16), keyed by global id = layer*n_experts + expert, LRU-evicted. A routing hit skips
-// the DMA + dequant + transpose entirely. Per-slot events guard slot reuse across streams.
+// fp16). PARTITIONED PER LAYER — each layer owns `per_layer` slots with its own LRU, so
+// one layer's sweep never evicts another's (no sequential-sweep thrash). per_layer spans
+// n_used (minimal) -> n_experts (whole model resident). A routing hit skips the DMA +
+// dequant + transpose. Per-slot events guard slot reuse across the copy/compute streams.
 struct ExpertCache {
-    int capacity = 0;
+    int capacity = 0;                  // total slots = n_layers * per_layer
+    int per_layer = 0;                 // resident experts per layer
+    int n_experts = 0;
     size_t stride = 0;                 // fp16 elems per expert (gate|up|down = 3*dim*ef)
     __half* pool = nullptr;            // capacity * stride
-    std::vector<int> slot_key;         // slot -> key (-1 empty)
+    std::vector<int> slot_key;         // slot -> expert id within its layer (-1 empty)
     std::vector<uint64_t> slot_lru;    // slot -> last-use tick
-    std::vector<int> key_slot;         // key -> slot (-1 not resident), size n_layers*n_experts
     std::vector<cudaEvent_t> slot_evt; // recorded on compute stream after a slot is read
     uint64_t tick = 0;
     long hits = 0, misses = 0;

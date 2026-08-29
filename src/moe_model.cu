@@ -186,20 +186,20 @@ static void session_stream_mat(MoeSession& S, const MatRef& mr, cudaStream_t st)
     session_stream_to(S, mr, S.arena + mr.arena_off, st);
 }
 
-// Resolve an expert's cache slot index. *hit set if already resident (no streaming
-// needed). On a miss, evicts the LRU slot and reserves it for `key`.
-static int cache_slot(ExpertCache& c, int key, bool* hit) {
-    if (c.key_slot[key] >= 0) {
-        int s = c.key_slot[key]; c.slot_lru[s] = ++c.tick; *hit = true; ++c.hits;
-        return s;
-    }
-    int victim = 0; uint64_t best = UINT64_MAX;
-    for (int s = 0; s < c.capacity; ++s) {
+// Resolve expert `e` of layer `L` to a cache slot, searching only THIS layer's region
+// (slots [L*per_layer, +per_layer)). *hit if already resident. Miss => LRU-evict within
+// the layer's own region, so other layers are never disturbed.
+static int cache_slot(ExpertCache& c, int L, int e, bool* hit) {
+    int r0 = L * c.per_layer;
+    for (int j = 0; j < c.per_layer; ++j)
+        if (c.slot_key[r0 + j] == e) { c.slot_lru[r0 + j] = ++c.tick; *hit = true; ++c.hits; return r0 + j; }
+    int victim = r0; uint64_t best = UINT64_MAX;
+    for (int j = 0; j < c.per_layer; ++j) {
+        int s = r0 + j;
         if (c.slot_key[s] < 0) { victim = s; break; }       // prefer an empty slot
         if (c.slot_lru[s] < best) { best = c.slot_lru[s]; victim = s; }
     }
-    if (c.slot_key[victim] >= 0) c.key_slot[c.slot_key[victim]] = -1;   // evict old key
-    c.slot_key[victim] = key; c.key_slot[key] = victim; c.slot_lru[victim] = ++c.tick;
+    c.slot_key[victim] = e; c.slot_lru[victim] = ++c.tick;
     *hit = false; ++c.misses;
     return victim;
 }
@@ -225,20 +225,22 @@ bool moe_session_init(LoadedMoeModel& m, int max_T, double budget_gb, MoeSession
     S->kv.n_layers=m.n_layers; S->kv.max_T=max_T; S->kv.kvd=kvd; S->kv.len=0;
     cudaMalloc(&S->kv.K,(size_t)m.n_layers*max_T*kvd*2); cudaMalloc(&S->kv.V,(size_t)m.n_layers*max_T*kvd*2);
 
-    // Hot-expert cache sized from the budget: C = budget / (one expert's fp16 bytes).
+    // Hot-expert cache sized from the budget, PARTITIONED PER LAYER:
+    // per_layer = clamp(budget / one-expert-bytes / n_layers, n_used, n_experts).
     size_t stride = m.blob.expert_stride;                 // fp16 elems per expert (gate|up|down)
     double expert_gb = stride * 2.0 / 1e9;
-    int C = budget_gb > 0 ? (int)(budget_gb / expert_gb) : mc.n_used;
-    if (C < mc.n_used) C = mc.n_used;                     // must hold at least one layer's active set
-    int total_experts = m.n_layers * E;
-    if (C > total_experts) C = total_experts;
+    int per_layer = budget_gb > 0 ? (int)(budget_gb / expert_gb / m.n_layers) : mc.n_used;
+    if (per_layer < mc.n_used) per_layer = mc.n_used;     // hold at least a layer's active set
+    if (per_layer > E) per_layer = E;                     // whole layer resident = cap
+    int C = m.n_layers * per_layer;
     ExpertCache& c = S->cache;
-    c.capacity = C; c.stride = stride;
+    c.capacity = C; c.per_layer = per_layer; c.n_experts = E; c.stride = stride;
     cudaMalloc(&c.pool, (size_t)C * stride * 2);
-    c.slot_key.assign(C, -1); c.slot_lru.assign(C, 0); c.key_slot.assign(total_experts, -1);
+    c.slot_key.assign(C, -1); c.slot_lru.assign(C, 0);
     c.slot_evt.resize(C); for (int i=0;i<C;++i) cudaEventCreateWithFlags(&c.slot_evt[i], cudaEventDisableTiming);
-    printf("hot-expert cache: %d experts resident (%.2f GB), %d total -> %.0f%% cacheable | budget=%.1f GB\n",
-           C, C*expert_gb, total_experts, 100.0*C/total_experts, budget_gb);
+    printf("hot-expert cache: %d/%d experts per layer resident (%.2f GB total) | budget=%.1f GB%s\n",
+           per_layer, E, C*expert_gb, budget_gb,
+           C*expert_gb > budget_gb + 0.01 ? "  (min n_used/layer exceeds budget)" : "");
 
     S->wg.resize(E); S->wu.resize(E); S->wd.resize(E);   // per-layer active-expert ptrs (set in eval)
     S->w.attn_norm=S->arena+m.blob.off_attn_norm; S->w.wq=S->arena+m.blob.off_wq; S->w.wk=S->arena+m.blob.off_wk;
@@ -273,7 +275,7 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
         // Resolve each active expert against the cache; stream ONLY the misses on cs.
         for (int a=0; a<na; ++a) {
             int e = active[a]; bool hit;
-            int slot = cache_slot(c, L*E + e, &hit); slot_of[a] = slot; miss[a] = !hit;
+            int slot = cache_slot(c, L, e, &hit); slot_of[a] = slot; miss[a] = !hit;
             __half* base = c.pool + (size_t)slot * c.stride;
             S.wg[e] = base; S.wu[e] = base + m.blob.off_eup; S.wd[e] = base + m.blob.off_edown;
             if (!hit) {
