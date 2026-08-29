@@ -399,9 +399,11 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
     ExpertCache& c = S.cache;
     // Dense fused path: one-expert model, all weights fused-GEMV capable -> compute each
     // layer straight from mmap quant (no dequant arena/transpose/cache). Used for decode
-    // and short prefills; the fused GEMV re-reads W per token, so long prompts (n_new>32)
-    // keep the dequant-once + cuBLAS-GEMM path where the weight read amortizes over tokens.
-    bool dense_fused = (E == 1 && n_new <= 32 && dense_decode_supported(m));
+    // and prefills up to a crossover: the fused GEMV re-reads W per token (~cost n_new x
+    // one decode), while the old dequant+transpose+cuBLAS pass is a fixed ~1 model pass.
+    // Measured crossover on 70B q4km is ~170 tokens; use 160 so typical prompts get the
+    // fused path (avoids the ~55s naive-transpose prefill), long prompts keep GEMM.
+    bool dense_fused = (E == 1 && n_new <= 160 && dense_decode_supported(m));
     int active[256]; bool miss[256]; int slot_of[256];
     for (int L=0; L<m.n_layers; ++L) {
         if (dense_fused) { dense_decode_layer(S, L, len_before, n_new, S.cm); continue; }
