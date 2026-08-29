@@ -21,9 +21,12 @@ static int run(const char* name, uint32_t type, int block_bytes, int block_elems
     for (auto& b : W) b = rand() & 0xFF;                 // random bytes (dequant formula applies to any)
     // Give Q8_0/Q4_K a sane fp16 scale so values don't blow up: overwrite the scale halfs.
     for (int o = 0; o < n_out; ++o) for (int b = 0; b < nb; ++b) {
-        __half* d = (__half*)(W.data() + ((size_t)o * nb + b) * block_bytes);
-        d[0] = __float2half(0.05f * (((o + b) % 7) + 1));
-        if (type == 12) d[1] = __float2half(0.03f * ((b % 5) + 1));   // Q4_K dmin
+        uint8_t* blk = W.data() + ((size_t)o * nb + b) * block_bytes;
+        __half* d = (__half*)blk;
+        float dv = 0.05f * (((o + b) % 7) + 1);
+        if (type == 14) *(__half*)(blk + 208) = __float2half(dv * 0.05f);  // Q6_K d at offset 208 (int8 scales)
+        else { d[0] = __float2half(dv);
+               if (type == 12 || type == 13) d[1] = __float2half(0.03f * ((b % 5) + 1)); }  // Q4_K/Q5_K dmin
     }
     std::vector<__half> x((size_t)m * n_in), y_gpu((size_t)m * n_out);
     std::vector<float> y_ref((size_t)m * n_out, 0.0f);
@@ -74,6 +77,37 @@ static void ref_q4_K(const uint8_t* blk, int b, float* row) {
     }
 }
 
+static void ref_q5_K(const uint8_t* blk, int b, float* row) {
+    float d = __half2float(*(const __half*)blk), dmin = __half2float(*(const __half*)(blk + 2));
+    const uint8_t* scales = blk + 4; const uint8_t* qh = blk + 16; const uint8_t* ql = blk + 48;
+    int is = 0, yi = 0; uint8_t sc, mn, u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        get_scale_min_k4(is + 0, scales, &sc, &mn); float d1 = d * sc, m1 = dmin * mn;
+        get_scale_min_k4(is + 1, scales, &sc, &mn); float d2 = d * sc, m2 = dmin * mn;
+        for (int l = 0; l < 32; ++l) row[b * 256 + yi++] = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; ++l) row[b * 256 + yi++] = d2 * (float)((ql[l] >> 4)  + ((qh[l] & u2) ? 16 : 0)) - m2;
+        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+    }
+}
+static void ref_q6_K(const uint8_t* blk, int b, float* row) {
+    const uint8_t* ql = blk; const uint8_t* qh = blk + 128; const int8_t* sc = (const int8_t*)(blk + 192);
+    float d = __half2float(*(const __half*)(blk + 208));
+    for (int nn = 0; nn < 256; nn += 128) {
+        const uint8_t* Ql = ql + (nn / 128) * 64; const uint8_t* Qh = qh + (nn / 128) * 32; const int8_t* Sc = sc + (nn / 128) * 8;
+        for (int l = 0; l < 32; ++l) {
+            int is = l / 16;
+            int q1 = (int)((Ql[l + 0] & 0xF) | (((Qh[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((Ql[l + 32] & 0xF) | (((Qh[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((Ql[l + 0] >> 4)  | (((Qh[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((Ql[l + 32] >> 4) | (((Qh[l] >> 6) & 3) << 4)) - 32;
+            row[b * 256 + nn + l + 0]  = d * Sc[is + 0] * q1;
+            row[b * 256 + nn + l + 32] = d * Sc[is + 2] * q2;
+            row[b * 256 + nn + l + 64] = d * Sc[is + 4] * q3;
+            row[b * 256 + nn + l + 96] = d * Sc[is + 6] * q4;
+        }
+    }
+}
+
 // Time a decode-shape GEMV (m=1) and report latency + achieved weight bandwidth. GEMV is
 // bandwidth-bound, so GB/s near the device peak means the kernel is close to optimal.
 static void bench(const char* name, uint32_t type, int block_bytes, int block_elems) {
@@ -104,10 +138,14 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "bench") {
         bench("Q8_0", 8, 34, 32);
         bench("Q4_K", 12, 144, 256);
+        bench("Q5_K", 13, 176, 256);
+        bench("Q6_K", 14, 210, 256);
         return 0;
     }
     int rc = 0;
     rc |= run("fused_gemv Q8_0", 8, 34, 32, ref_q8_0);
     rc |= run("fused_gemv Q4_K", 12, 144, 256, ref_q4_K);
+    rc |= run("fused_gemv Q5_K", 13, 176, 256, ref_q5_K);
+    rc |= run("fused_gemv Q6_K", 14, 210, 256, ref_q6_K);
     return rc;
 }
