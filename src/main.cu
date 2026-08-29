@@ -79,7 +79,8 @@ static int cmd_run(int argc, char** argv) {
         std::string fmt = tokenizer_apply_chat(tok, msgs, true);
         if (fmt.empty()) fmt = prev_fmt + user;              // no chat template: treat as raw text
         std::string delta = fmt.size() >= prev_fmt.size() ? fmt.substr(prev_fmt.size()) : fmt;
-        std::vector<int> ids = tokenizer_encode(tok, delta, /*add_special=*/S.len == 0);
+        bool add_special = S.len == 0;   // BOS only on the first turn
+        std::vector<int> ids = tokenizer_encode(tok, delta, add_special);
         if (ids.empty()) { printf("[empty prompt]\n"); return; }
         if (!moe_session_eval(S, ids.data(), (int)ids.size(), &err)) { printf("[eval: %s]\n", err.c_str()); return; }
         std::string reply;
