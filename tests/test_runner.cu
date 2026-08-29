@@ -54,7 +54,7 @@ int main() {
     Gemm g; gemm_create(&g);
 
     auto run = [&](std::vector<__half>& out) {
-        forward_logits(cfg, blob, hw, n_layers, rw, d_ids, T, vocab, bufs, s, pool, &g, cs, ms);
+        forward_logits(cfg, blob, hw, n_layers, 1, rw, d_ids, T, vocab, bufs, s, pool, &g, cs, ms);
         out.resize(vocab);
         cudaMemcpy(out.data(), bufs.logits, vocab * sizeof(__half), cudaMemcpyDeviceToHost);
     };

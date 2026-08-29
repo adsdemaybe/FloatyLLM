@@ -16,7 +16,7 @@ enum GgufValueType {
 
 // ggml tensor types we care about (values match the ggml enum).
 enum GgmlType { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q5_0 = 6,
-                GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q6_K = 14 };
+                GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 };
 
 struct MetaValue {
     int type = 0;        // GgufValueType
@@ -29,20 +29,28 @@ struct TensorInfo {
     std::string name;
     uint32_t ggml_type = 0;
     std::vector<uint64_t> dims;
-    uint64_t offset = 0;       // relative to the data section start
+    uint64_t offset = 0;       // relative to its shard's data section start
+    int shard = 0;             // which shard holds this tensor's data
+};
+
+struct Shard {
+    const uint8_t* data = nullptr;   // mmap'd file (disk-backed)
+    size_t size = 0;
+    int fd = -1;
+    size_t data_offset = 0;          // start of this shard's tensor data
 };
 
 struct GgufFile {
     uint32_t version = 0;
-    std::vector<uint8_t> bytes;                          // whole file, owned
-    std::unordered_map<std::string, MetaValue> meta;
-    std::vector<TensorInfo> tensors;
+    std::vector<Shard> shards;                           // one per split file
+    std::unordered_map<std::string, MetaValue> meta;     // from shard 0
+    std::vector<TensorInfo> tensors;                     // merged across shards
     std::unordered_map<std::string, int> tensor_index;   // name -> index in tensors
-    size_t data_offset = 0;                              // start of tensor data in bytes
 };
 
-// Load + parse a GGUF file. Returns false and sets *err on failure.
+// Load + parse a GGUF file (mmap, not read into RAM). Returns false + *err on failure.
 bool gguf_load(const char* path, GgufFile* out, std::string* err);
+void gguf_close(GgufFile* g);   // munmap
 
 // Typed metadata getters. Return false if the key is missing or the wrong type.
 bool gguf_get_u32(const GgufFile& g, const std::string& key, uint32_t* v);

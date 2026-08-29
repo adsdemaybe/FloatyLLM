@@ -1,5 +1,6 @@
 // Streaming scheduler implementation.
 #include "stream.h"
+#include "dequant.h"
 
 LayerBlob layer_blob_layout(const LlamaConfig& cfg) {
     size_t dim = cfg.dim;
@@ -61,30 +62,128 @@ void slotpool_destroy(SlotPool* p) {
 }
 
 void stream_forward(const LlamaConfig& cfg, const LayerBlob& blob,
-                    const __half* h_weights, int n_layers,
+                    const __half* h_weights, int n_layers, int batch_layers,
                     __half* hidden, const int* d_positions, int n_tokens,
                     LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream) {
+    if (batch_layers < 1) batch_layers = 1;
     int N = pool.n_slots;
+    int n_batches = (n_layers + batch_layers - 1) / batch_layers;
 
-    // prefetch(L): copy layer L's blob into its ring slot on the copy stream,
-    // after the slot's previous occupant finished compute (device-side wait).
-    auto prefetch = [&](int L) {
-        if (L >= n_layers) return;
-        int s = L % N;
-        cudaStreamWaitEvent(copy_stream, pool.compute_done[s], 0);
-        cudaMemcpyAsync(pool.d_slots[s], h_weights + (size_t)L * blob.total_elems,
-                        blob.total_elems * sizeof(__half), cudaMemcpyHostToDevice, copy_stream);
+    // prefetch a whole batch of contiguous layers in ONE big DMA (max PCIe size).
+    auto prefetch_batch = [&](int b) {
+        if (b >= n_batches) return;
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = batch_layers;
+        if (first + cnt > n_layers) cnt = n_layers - first;
+        cudaStreamWaitEvent(copy_stream, pool.compute_done[s], 0);   // slot (batch) free?
+        cudaMemcpyAsync(pool.d_slots[s], h_weights + (size_t)first * blob.total_elems,
+                        (size_t)cnt * blob.total_elems * sizeof(__half),
+                        cudaMemcpyHostToDevice, copy_stream);        // one transfer, B layers
         cudaEventRecord(pool.copy_done[s], copy_stream);
     };
 
-    prefetch(0);
-    for (int L = 0; L < n_layers; ++L) {
-        prefetch(L + 1);                                   // keep copy engine ahead
-        int s = L % N;
+    prefetch_batch(0);
+    for (int b = 0; b < n_batches; ++b) {
+        prefetch_batch(b + 1);                                       // next batch while this computes
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
         cudaStreamWaitEvent(compute_stream, pool.copy_done[s], 0);
-        LayerWeights w = weights_from_blob(pool.d_slots[s], blob);
-        layer_forward(cfg, w, hidden, d_positions, n_tokens, scratch, gemm, compute_stream);
+        for (int l = 0; l < cnt; ++l) {
+            LayerWeights w = weights_from_blob(pool.d_slots[s] + (size_t)l * blob.total_elems, blob);
+            layer_forward(cfg, w, hidden, d_positions, n_tokens, scratch, gemm, compute_stream);
+        }
+        cudaEventRecord(pool.compute_done[s], compute_stream);
+    }
+    cudaStreamSynchronize(compute_stream);
+}
+
+static inline void dequant_layer(const uint8_t* q, __half* arena, int q_bits,
+                                 int blocks_per_layer, cudaStream_t stream) {
+    if (q_bits == 4) dequant_q4_0((const BlockQ40*)q, arena, blocks_per_layer, stream);
+    else dequant_q8_0((const BlockQ80*)q, arena, blocks_per_layer, stream);
+}
+
+void stream_forward_q8_cached(const LlamaConfig& cfg, const LayerBlob& blob,
+                              const uint8_t* h_q8, size_t q8_layer_bytes, int q_bits, int n_layers,
+                              int batch_layers, __half* arena, __half* hidden,
+                              const int* d_positions, int n_new, int len_before, KVCache& kv,
+                              LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
+                              cudaStream_t copy_stream, cudaStream_t compute_stream) {
+    if (batch_layers < 1) batch_layers = 1;
+    int N = pool.n_slots;
+    int n_batches = (n_layers + batch_layers - 1) / batch_layers;
+    int blocks_per_layer = (int)(blob.total_elems / 32);
+
+    auto prefetch_batch = [&](int b) {
+        if (b >= n_batches) return;
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
+        cudaStreamWaitEvent(copy_stream, pool.compute_done[s], 0);
+        cudaMemcpyAsync((uint8_t*)pool.d_slots[s], h_q8 + (size_t)first * q8_layer_bytes,
+                        (size_t)cnt * q8_layer_bytes, cudaMemcpyHostToDevice, copy_stream);
+        cudaEventRecord(pool.copy_done[s], copy_stream);
+    };
+
+    prefetch_batch(0);
+    for (int b = 0; b < n_batches; ++b) {
+        prefetch_batch(b + 1);
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
+        cudaStreamWaitEvent(compute_stream, pool.copy_done[s], 0);
+        const uint8_t* slot = (const uint8_t*)pool.d_slots[s];
+        for (int l = 0; l < cnt; ++l) {
+            const uint8_t* q = slot + (size_t)l * q8_layer_bytes;
+            dequant_layer(q, arena, q_bits, blocks_per_layer, compute_stream);
+            LayerWeights w = weights_from_blob(arena, blob);
+            layer_forward_cached(cfg, w, hidden, d_positions, n_new, first + l, len_before,
+                                 kv, scratch, gemm, compute_stream);
+        }
+        cudaEventRecord(pool.compute_done[s], compute_stream);
+    }
+    cudaStreamSynchronize(compute_stream);
+}
+
+void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
+                       const uint8_t* h_q8, size_t q8_layer_bytes, int q_bits, int n_layers,
+                       int batch_layers, __half* arena, __half* hidden,
+                       const int* d_positions, int n_tokens, LayerScratch& scratch,
+                       SlotPool& pool, Gemm* gemm,
+                       cudaStream_t copy_stream, cudaStream_t compute_stream) {
+    if (batch_layers < 1) batch_layers = 1;
+    int N = pool.n_slots;
+    int n_batches = (n_layers + batch_layers - 1) / batch_layers;
+    int blocks_per_layer = (int)(blob.total_elems / 32);
+
+    auto prefetch_batch = [&](int b) {
+        if (b >= n_batches) return;
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
+        cudaStreamWaitEvent(copy_stream, pool.compute_done[s], 0);
+        cudaMemcpyAsync((uint8_t*)pool.d_slots[s], h_q8 + (size_t)first * q8_layer_bytes,
+                        (size_t)cnt * q8_layer_bytes, cudaMemcpyHostToDevice, copy_stream);
+        cudaEventRecord(pool.copy_done[s], copy_stream);
+    };
+
+    prefetch_batch(0);
+    for (int b = 0; b < n_batches; ++b) {
+        prefetch_batch(b + 1);
+        int s = b % N;
+        int first = b * batch_layers;
+        int cnt = (first + batch_layers > n_layers) ? (n_layers - first) : batch_layers;
+        cudaStreamWaitEvent(compute_stream, pool.copy_done[s], 0);
+        const uint8_t* slot = (const uint8_t*)pool.d_slots[s];
+        for (int l = 0; l < cnt; ++l) {
+            const uint8_t* q = slot + (size_t)l * q8_layer_bytes;
+            dequant_layer(q, arena, q_bits, blocks_per_layer, compute_stream);   // GPU dequant -> fp16 arena
+            LayerWeights w = weights_from_blob(arena, blob);
+            layer_forward(cfg, w, hidden, d_positions, n_tokens, scratch, gemm, compute_stream);
+        }
         cudaEventRecord(pool.compute_done[s], compute_stream);
     }
     cudaStreamSynchronize(compute_stream);

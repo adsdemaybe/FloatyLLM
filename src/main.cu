@@ -2,6 +2,7 @@
 // streamed forward. usage: semillm <model.gguf> <n_generate> <tok0> [tok1 ...]
 // Prints the generated token ids (detokenize with llama.cpp) + tokens/s + VRAM.
 #include "weights.h"
+#include "moe_model.h"
 #include "runner.h"
 #include "sampling.h"
 #include <cstdio>
@@ -27,12 +28,36 @@ int main(int argc, char** argv) {
     report_mem("start");
     GgufFile g; std::string err;
     if (!gguf_load(argv[1], &g, &err)) { printf("gguf_load: %s\n", err.c_str()); return 1; }
+    int q_bits = 4;   // stream Q4_0 by default (4x smaller than fp16); SEMILLM_QBITS=8 for Q8_0
+    const char* qb = getenv("SEMILLM_QBITS");
+    if (qb && atoi(qb) == 8) q_bits = 8;
+
+    // MoE models: separate path (router + experts), streaming original quant from mmap.
+    if (is_moe_model(g)) {
+        LoadedMoeModel mm;
+        if (!load_moe_model(g, &mm, &err)) { printf("load_moe_model: %s\n", err.c_str()); return 1; }
+        printf("MoE: arch=%s layers=%d dim=%d experts=%d/%d expert_ffn=%d vocab=%d | %.1f GB fp16, streamed from disk\n",
+               mm.arch.c_str(), mm.n_layers, mm.cfg.dim, mm.mcfg.n_used, mm.mcfg.n_experts,
+               mm.mcfg.expert_ffn, mm.vocab, mm.blob.total_elems * 2.0 / 1e9 * mm.n_layers);
+        report_mem("after load");   // mmap kept alive for streaming
+        double budget = 8.0;
+        const char* bg = getenv("SEMILLM_BUDGET"); if (bg && atof(bg) > 0) budget = atof(bg);
+        if (!moe_generate(mm, ids, n_gen, budget, &err)) { printf("moe_generate: %s\n", err.c_str()); return 1; }
+        printf("generated ids:");
+        for (int i = prompt_len; i < (int)ids.size(); ++i) printf(" %d", ids[i]);
+        printf("\nfull sequence:"); for (int id : ids) printf(" %d", id); printf("\n");
+        report_mem("after gen");
+        gguf_close(&g);
+        return 0;
+    }
+
     LoadedModel m;
-    if (!load_model(g, &m, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
+    if (!load_model(g, &m, q_bits, &err)) { printf("load_model: %s\n", err.c_str()); return 1; }
+    gguf_close(&g);   // weights extracted; release the mmap
     const LlamaConfig& cfg = m.cfg;
-    printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB fp16\n",
+    printf("model: arch=%s layers=%d dim=%d heads=%d/%d ffn=%d vocab=%d | %.1f GB Q%d streamed (vs %.1f GB fp16)\n",
            m.arch.c_str(), m.n_layers, cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.ffn_dim,
-           m.vocab, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
+           m.vocab, m.q8_layer_bytes / 1e9 * m.n_layers, m.q_bits, m.blob.total_elems * 2.0 * m.n_layers / 1e9);
 
     int qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ffn = cfg.ffn_dim;
     RunnerBufs bufs;
@@ -40,16 +65,23 @@ int main(int argc, char** argv) {
     cudaMalloc(&bufs.normed, (size_t)max_T*cfg.dim*sizeof(__half));
     cudaMalloc(&bufs.positions, max_T*sizeof(int));
     cudaMalloc(&bufs.logits, (size_t)m.vocab*sizeof(__half));
+    cudaMalloc(&bufs.arena, (size_t)m.blob.total_elems*sizeof(__half));   // fp16 dequant scratch
     LayerScratch s;
     cudaMalloc(&s.xn, (size_t)max_T*cfg.dim*sizeof(__half)); cudaMalloc(&s.q, (size_t)max_T*qd*sizeof(__half));
     cudaMalloc(&s.k, (size_t)max_T*kvd*sizeof(__half)); cudaMalloc(&s.v, (size_t)max_T*kvd*sizeof(__half));
     cudaMalloc(&s.att, (size_t)max_T*qd*sizeof(__half)); cudaMalloc(&s.proj, (size_t)max_T*cfg.dim*sizeof(__half));
     cudaMalloc(&s.gate, (size_t)max_T*ffn*sizeof(__half)); cudaMalloc(&s.up, (size_t)max_T*ffn*sizeof(__half));
 
-    int n_slots = 4;
-    SlotPool pool; slotpool_create(&pool, n_slots, m.blob.total_elems);
-    printf("streamed weight working set = %d slots x %.1f MB = %.2f GB VRAM\n",
-           n_slots, m.blob.total_elems*2/1e6, (double)n_slots*m.blob.total_elems*2/1e9);
+    int n_slots = 4, batch_layers = 1;
+    const char* slots_env = getenv("SEMILLM_SLOTS");
+    if (slots_env) { int v = atoi(slots_env); if (v >= 2) n_slots = v; }
+    const char* batch_env = getenv("SEMILLM_BATCH");
+    if (batch_env) { int v = atoi(batch_env); if (v >= 1) batch_layers = v; }
+    size_t slot_elems = ((size_t)batch_layers * m.q8_layer_bytes + 1) / 2;   // __half units covering Q8 bytes
+    SlotPool pool; slotpool_create(&pool, n_slots, slot_elems);
+    printf("streamed working set = %d slots x %d layers/batch x %.1f MB (Q8) = %.2f GB VRAM\n",
+           n_slots, batch_layers, m.q8_layer_bytes/1e6,
+           (double)n_slots*batch_layers*m.q8_layer_bytes/1e9);
     report_mem("after alloc");
 
     int* d_ids; cudaMalloc(&d_ids, max_T*sizeof(int));
@@ -58,33 +90,54 @@ int main(int argc, char** argv) {
     std::vector<__half> logits(m.vocab);
     std::vector<float> lf(m.vocab);
 
-    // Greedy generation: re-run the growing prefix each step (no KV cache yet).
-    printf("\ngenerating %d tokens (greedy)...\n", n_gen);
-    auto t0 = std::chrono::steady_clock::now();
-    for (int step = 0; step < n_gen; ++step) {
-        int T = (int)ids.size();
-        cudaMemcpy(d_ids, ids.data(), T*sizeof(int), cudaMemcpyHostToDevice);
-        forward_logits(cfg, m.blob, m.h_layer_weights, m.n_layers, m.rw, d_ids, T, m.vocab,
-                       bufs, s, pool, &gemm, cs, ms);
+    // KV cache: persistent K/V per layer, so decode processes 1 new token per step
+    // (not the whole growing prefix).
+    KVCache kv;
+    kv.n_layers = m.n_layers; kv.max_T = max_T; kv.kvd = cfg.n_kv_heads * cfg.head_dim; kv.len = 0;
+    size_t kv_elems = (size_t)m.n_layers * max_T * kv.kvd;
+    cudaMalloc(&kv.K, kv_elems * sizeof(__half));
+    cudaMalloc(&kv.V, kv_elems * sizeof(__half));
+
+    auto sample_next = [&]() -> int {
         cudaMemcpy(logits.data(), bufs.logits, m.vocab*sizeof(__half), cudaMemcpyDeviceToHost);
         for (int v = 0; v < m.vocab; ++v) lf[v] = __half2float(logits[v]);
-        int next = sample_greedy(lf.data(), m.vocab);
+        return sample_greedy(lf.data(), m.vocab);
+    };
+
+    printf("\nprefill %d prompt tokens + generate %d (KV cache)...\n", prompt_len, n_gen);
+    // Prefill: whole prompt through the cache in one pass -> first token.
+    cudaMemcpy(d_ids, ids.data(), prompt_len*sizeof(int), cudaMemcpyHostToDevice);
+    forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.q_bits, m.n_layers, batch_layers,
+                          m.rw, d_ids, prompt_len, 0, kv, m.vocab, bufs, s, pool, &gemm, cs, ms);
+    kv.len = prompt_len;
+    int next = sample_next();
+    ids.push_back(next);
+
+    // Decode: one token per step.
+    auto t0 = std::chrono::steady_clock::now();
+    for (int step = 1; step < n_gen; ++step) {
+        cudaMemcpy(d_ids, &next, sizeof(int), cudaMemcpyHostToDevice);
+        forward_logits_cached(cfg, m.blob, m.h_layer_q8, m.q8_layer_bytes, m.q_bits, m.n_layers, batch_layers,
+                              m.rw, d_ids, 1, kv.len, kv, m.vocab, bufs, s, pool, &gemm, cs, ms);
+        kv.len += 1;
+        next = sample_next();
         ids.push_back(next);
-        printf("  step %d -> token %d\n", step, next);
     }
     auto t1 = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
+    int decoded = n_gen - 1;
 
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { printf("CUDA error: %s\n", cudaGetErrorString(e)); return 1; }
 
-    printf("\ngenerated ids:");
+    printf("generated ids:");
     for (int i = prompt_len; i < (int)ids.size(); ++i) printf(" %d", ids[i]);
     printf("\nfull sequence:");
     for (int id : ids) printf(" %d", id);
-    printf("\n%.2f tokens/s (%d tokens in %.2fs, no KV cache)\n", n_gen / secs, n_gen, secs);
+    if (decoded > 0) printf("\n%.2f tokens/s decode (%d tokens in %.2fs, KV cache)\n", decoded / secs, decoded, secs);
     report_mem("after gen");
 
+    cudaFree(kv.K); cudaFree(kv.V);
     slotpool_destroy(&pool); gemm_destroy(&gemm); free_model(&m);
     return 0;
 }

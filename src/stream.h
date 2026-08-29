@@ -31,9 +31,32 @@ LayerWeights weights_from_blob(const __half* base, const LayerBlob& b);
 
 // Stream n_layers of packed fp16 weights (h_weights: pinned, layer-major,
 // n_layers * blob.total_elems) through layer_forward, updating hidden in place.
-// Copy runs on copy_stream, compute on compute_stream; execute-on-completion.
+// batch_layers = layers copied per DMA: a batch is contiguous in h_weights, so
+// each prefetch is ONE big cudaMemcpyAsync of batch_layers layers -> maximizes
+// PCIe transfer size while the previous batch computes. pool slots must be sized
+// batch_layers * blob.total_elems. Copy on copy_stream, compute on compute_stream.
 void stream_forward(const LlamaConfig& cfg, const LayerBlob& blob,
-                    const __half* h_weights, int n_layers,
+                    const __half* h_weights, int n_layers, int batch_layers,
                     __half* hidden, const int* d_positions, int n_tokens,
                     LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
                     cudaStream_t copy_stream, cudaStream_t compute_stream);
+
+// Quantized streaming: h_q8 holds per-layer Q8_0 blobs (q8_layer_bytes each). A
+// batch of Q8_0 layers is copied in ONE DMA (half the bytes of fp16), then each
+// layer is dequantized on the GPU into `arena` (fp16, blob.total_elems) before
+// layer_forward. pool slots hold batch_layers * q8_layer_bytes bytes.
+void stream_forward_q8(const LlamaConfig& cfg, const LayerBlob& blob,
+                       const uint8_t* h_q8, size_t q8_layer_bytes, int q_bits, int n_layers,
+                       int batch_layers, __half* arena, __half* hidden,
+                       const int* d_positions, int n_tokens, LayerScratch& scratch,
+                       SlotPool& pool, Gemm* gemm,
+                       cudaStream_t copy_stream, cudaStream_t compute_stream);
+
+// Quantized streaming with KV cache: processes n_new tokens through every streamed
+// layer, using layer_forward_cached (append K/V at len_before, attend the cache).
+void stream_forward_q8_cached(const LlamaConfig& cfg, const LayerBlob& blob,
+                              const uint8_t* h_q8, size_t q8_layer_bytes, int q_bits, int n_layers,
+                              int batch_layers, __half* arena, __half* hidden,
+                              const int* d_positions, int n_new, int len_before, KVCache& kv,
+                              LayerScratch& scratch, SlotPool& pool, Gemm* gemm,
+                              cudaStream_t copy_stream, cudaStream_t compute_stream);

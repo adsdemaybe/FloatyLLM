@@ -53,12 +53,27 @@ int main() {
     cudaStreamCreate(&copy_stream); cudaStreamCreate(&compute_stream);
     __half* d_hidden_str; cudaMalloc(&d_hidden_str, h_init.size()*sizeof(__half));
     cudaMemcpy(d_hidden_str, h_init.data(), h_init.size()*sizeof(__half), cudaMemcpyHostToDevice);
-    stream_forward(cfg, blob, hw, n_layers, d_hidden_str, dpos, T, s, pool, &g, copy_stream, compute_stream);
+    stream_forward(cfg, blob, hw, n_layers, 1, d_hidden_str, dpos, T, s, pool, &g, copy_stream, compute_stream);
     std::vector<__half> out_str(T*cfg.dim);
     cudaMemcpy(out_str.data(), d_hidden_str, out_str.size()*sizeof(__half), cudaMemcpyDeviceToHost);
 
+    // --- batched streaming: 3 layers per DMA (one big transfer), ring of 2 batches ---
+    SlotPool poolb; slotpool_create(&poolb, 2, (size_t)3 * per);
+    __half* d_hidden_b; cudaMalloc(&d_hidden_b, h_init.size()*sizeof(__half));
+    cudaMemcpy(d_hidden_b, h_init.data(), h_init.size()*sizeof(__half), cudaMemcpyHostToDevice);
+    stream_forward(cfg, blob, hw, n_layers, 3, d_hidden_b, dpos, T, s, poolb, &g, copy_stream, compute_stream);
+    std::vector<__half> out_batch(T*cfg.dim);
+    cudaMemcpy(out_batch.data(), d_hidden_b, out_batch.size()*sizeof(__half), cudaMemcpyDeviceToHost);
+    slotpool_destroy(&poolb);
+
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { printf("CUDA error: %s\n", cudaGetErrorString(e)); return 2; }
+
+    float batch_diff = 0.0f;
+    for (int i = 0; i < T*cfg.dim; ++i)
+        batch_diff = fmaxf(batch_diff, fabsf(__half2float(out_res[i]) - __half2float(out_batch[i])));
+    printf("batched(3/DMA) vs resident: max_diff=%.6f\n", batch_diff);
+    if (batch_diff > 1e-3f) { printf("FAIL: batched streaming differs\n"); return 1; }
 
     int fails = 0; float max_diff = 0.0f; bool finite = true;
     for (int i = 0; i < T*cfg.dim; ++i) {

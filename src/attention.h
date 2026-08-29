@@ -11,3 +11,10 @@
 void attention(const __half* Q, const __half* K, const __half* V, __half* out,
                int n_tokens, int n_heads, int n_kv_heads, int head_dim,
                float scale, cudaStream_t stream);
+
+// Cached attention: n_new query tokens (abs positions len_before..len_before+n_new-1)
+// attend a KV cache [max_T, n_kv_heads*head_dim] filled up to len_before+n_new
+// (causal). Q: [n_new, n_heads, head_dim]. Kc/Vc: cache base for this layer.
+void attention_cached(const __half* Q, const __half* Kc, const __half* Vc, __half* out,
+                      int n_new, int len_before, int n_heads, int n_kv_heads,
+                      int head_dim, float scale, cudaStream_t stream);

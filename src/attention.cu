@@ -51,3 +51,48 @@ void attention(const __half* Q, const __half* K, const __half* V, __half* out,
     attention_kernel<<<blocks, threads, 0, stream>>>(
         Q, K, V, out, n_tokens, n_heads, n_kv_heads, head_dim, scale);
 }
+
+// One thread per (new query token, head). Query i has abs position len_before+i and
+// attends cache keys 0..len_before+i. K/V cache rows are contiguous [pos*kvd + kvh*D].
+__global__ void attention_cached_kernel(const __half* Q, const __half* Kc, const __half* Vc,
+                                        __half* out, int n_new, int len_before, int n_heads,
+                                        int n_kv_heads, int D, float scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_new * n_heads) return;
+    int i = idx / n_heads;          // new query index
+    int head = idx % n_heads;
+    int kvd = n_kv_heads * D;
+    int kvh = head / (n_heads / n_kv_heads);
+    int last = len_before + i;      // inclusive causal bound (abs position)
+
+    const __half* q = Q + ((size_t)i * n_heads + head) * D;
+    float acc[MAX_HEAD_DIM];
+    for (int d = 0; d < D; ++d) acc[d] = 0.0f;
+    float m = -1e30f, l = 0.0f;
+    for (int j = 0; j <= last; ++j) {
+        const __half* k = Kc + (size_t)j * kvd + (size_t)kvh * D;
+        const __half* v = Vc + (size_t)j * kvd + (size_t)kvh * D;
+        float s = 0.0f;
+        for (int d = 0; d < D; ++d) s += __half2float(q[d]) * __half2float(k[d]);
+        s *= scale;
+        float m_new = fmaxf(m, s);
+        float corr = expf(m - m_new);
+        float p = expf(s - m_new);
+        l = l * corr + p;
+        for (int d = 0; d < D; ++d) acc[d] = acc[d] * corr + p * __half2float(v[d]);
+        m = m_new;
+    }
+    __half* o = out + ((size_t)i * n_heads + head) * D;
+    float inv = 1.0f / l;
+    for (int d = 0; d < D; ++d) o[d] = __float2half(acc[d] * inv);
+}
+
+void attention_cached(const __half* Q, const __half* Kc, const __half* Vc, __half* out,
+                      int n_new, int len_before, int n_heads, int n_kv_heads,
+                      int head_dim, float scale, cudaStream_t stream) {
+    if (n_new <= 0) return;
+    int total = n_new * n_heads;
+    int threads = 128;
+    attention_cached_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+        Q, Kc, Vc, out, n_new, len_before, n_heads, n_kv_heads, head_dim, scale);
+}

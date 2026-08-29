@@ -10,13 +10,14 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 # Core library: everything in src/ except the entry point.
 file(GLOB CORE_SRC CONFIGURE_DEPENDS src/*.cu src/*.cpp)
 list(REMOVE_ITEM CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cu)
 add_library(semillm_core STATIC ${CORE_SRC})
 target_include_directories(semillm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(semillm_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt)
+target_link_libraries(semillm_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt Threads::Threads)
 
 add_executable(semillm src/main.cu)
 target_link_libraries(semillm PRIVATE semillm_core)
@@ -61,3 +62,15 @@ add_test(NAME stream COMMAND test_stream)
 add_executable(test_runner tests/test_runner.cu)
 target_link_libraries(test_runner PRIVATE semillm_core)
 add_test(NAME runner COMMAND test_runner)
+
+add_executable(test_moe tests/test_moe.cu)
+target_link_libraries(test_moe PRIVATE semillm_core)
+add_test(NAME moe COMMAND test_moe)
+
+add_executable(test_moe_layer tests/test_moe_layer.cu)
+target_link_libraries(test_moe_layer PRIVATE semillm_core)
+add_test(NAME moe_layer COMMAND test_moe_layer)
+
+add_executable(test_kquant_gpu tests/test_kquant_gpu.cu)
+target_link_libraries(test_kquant_gpu PRIVATE semillm_core)
+add_test(NAME kquant_gpu COMMAND test_kquant_gpu)
