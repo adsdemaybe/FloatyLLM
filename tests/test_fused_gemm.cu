@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <string>
 #include <cuda_fp16.h>
 
 static void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
@@ -73,8 +74,38 @@ static void ref_q4_K(const uint8_t* blk, int b, float* row) {
     }
 }
 
-int main() {
+// Time a decode-shape GEMV (m=1) and report latency + achieved weight bandwidth. GEMV is
+// bandwidth-bound, so GB/s near the device peak means the kernel is close to optimal.
+static void bench(const char* name, uint32_t type, int block_bytes, int block_elems) {
+    int n_in = 4096, n_out = 4096, m = 1, nb = n_in / block_elems;
+    size_t wbytes = (size_t)n_out * nb * block_bytes;
+    std::vector<uint8_t> W(wbytes); for (auto& b : W) b = rand() & 0xFF;
+    std::vector<__half> x((size_t)m * n_in, __float2half(0.01f));
+    uint8_t* dW; __half *dx, *dy;
+    cudaMalloc(&dW, wbytes); cudaMalloc(&dx, x.size()*2); cudaMalloc(&dy, (size_t)m*n_out*2);
+    cudaMemcpy(dW, W.data(), wbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size()*2, cudaMemcpyHostToDevice);
+    for (int i = 0; i < 10; ++i) fused_gemv(dW, dx, dy, m, n_out, n_in, type, 0);
+    cudaDeviceSynchronize();
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    int iters = 200;
+    cudaEventRecord(a);
+    for (int i = 0; i < iters; ++i) fused_gemv(dW, dx, dy, m, n_out, n_in, type, 0);
+    cudaEventRecord(b); cudaEventSynchronize(b);
+    float ms = 0; cudaEventElapsedTime(&ms, a, b);
+    double us = ms * 1000.0 / iters;
+    double gbps = wbytes / (us * 1e-6) / 1e9;
+    printf("%s [%dx%d m=%d]: %.1f us/call, %.0f GB/s (weights)\n", name, n_out, n_in, m, us, gbps);
+    cudaFree(dW); cudaFree(dx); cudaFree(dy);
+}
+
+int main(int argc, char** argv) {
     srand(123);
+    if (argc > 1 && std::string(argv[1]) == "bench") {
+        bench("Q8_0", 8, 34, 32);
+        bench("Q4_K", 12, 144, 256);
+        return 0;
+    }
     int rc = 0;
     rc |= run("fused_gemv Q8_0", 8, 34, 32, ref_q8_0);
     rc |= run("fused_gemv Q4_K", 12, 144, 256, ref_q4_K);
