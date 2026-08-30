@@ -22,3 +22,9 @@ void fused_gemv_q6_K(const uint8_t* W, const __half* x, __half* y, int m, int n_
 // falls back to dequant + cuBLAS).
 bool fused_gemv(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in,
                 uint32_t ggml_type, cudaStream_t stream);
+
+// Fused dequant-GEMM for prefill: reads each weight ONCE, accumulates over token columns
+// (vs fused_gemv which re-reads W per token). Same result; use for m>1. Returns false if
+// the type has no fused GEMM kernel.
+bool fused_gemm(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in,
+                uint32_t ggml_type, cudaStream_t stream);

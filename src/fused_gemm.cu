@@ -255,6 +255,164 @@ __global__ void gemv_q6_K_kernel(const uint8_t* W, const __half* x, __half* y,
     acc = warp_reduce(acc);
     if (lane == 0) y[(size_t)tok * n_out + o] = __float2half(acc);
 }
+// ===================== Fused dequant-GEMM (prefill: read W once, all m tokens) =====================
+// Decode uses fused GEMV (one token) which re-reads W per token -> for prefill (m tokens) that is
+// m full weight reads. These GEMM kernels read each weight ONCE and accumulate into TM token
+// accumulators, so a prefill reads W ceil(m/TM) times instead of m. Same per-type unpack as the
+// GEMV kernels above (verified against CPU ref); only the inner x-multiply is batched over tokens.
+constexpr int TILE_M = 8;
+
+// acc[t] += w * x[token (t0+t), pos] for the TM tokens in this tile (masked to m).
+template<int TM>
+__device__ __forceinline__ void mm_accum(float* acc, const __half* x, int n_in, int t0, int m,
+                                         int pos, float w) {
+    #pragma unroll
+    for (int t = 0; t < TM; ++t) { int tk = t0 + t; if (tk < m) acc[t] += w * __half2float(x[(size_t)tk * n_in + pos]); }
+}
+template<int TM>
+__device__ __forceinline__ void mm_store(float* acc, __half* y, int n_out, int t0, int m, int o, int lane) {
+    #pragma unroll
+    for (int t = 0; t < TM; ++t) { float a = warp_reduce(acc[t]); if (lane == 0) { int tk = t0 + t; if (tk < m) y[(size_t)tk * n_out + o] = __float2half(a); } }
+}
+
+template<int TM>
+__global__ void gemm_q4_K_kernel(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1); int o = blockIdx.x * WARPS + (threadIdx.x >> 5); int t0 = blockIdx.y * TM;
+    if (o >= n_out) return;
+    int nsb = n_in / 256; const uint8_t* wrow = W + (size_t)o * nsb * 144;
+    int g = lane >> 3, bl = (lane & 7) * 4;
+    float acc[TM]; for (int t = 0; t < TM; ++t) acc[t] = 0.f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* blk = wrow + (size_t)sb * 144;
+        float d = __half2float(*(const __half*)blk), dmin = __half2float(*(const __half*)(blk + 2));
+        const uint8_t* scales = blk + 4; uint8_t sc, mn;
+        get_scale_min_k4(g * 2 + 0, scales, &sc, &mn); float d1 = d * sc, m1 = dmin * mn;
+        get_scale_min_k4(g * 2 + 1, scales, &sc, &mn); float d2 = d * sc, m2 = dmin * mn;
+        uint32_t u = *(const uint32_t*)(blk + 16 + g * 32 + bl);
+        int base = sb * 256 + g * 64;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            uint8_t q = (u >> (8 * k)) & 0xFF;
+            mm_accum<TM>(acc, x, n_in, t0, m, base + bl + k,      d1 * (float)(q & 0xF) - m1);
+            mm_accum<TM>(acc, x, n_in, t0, m, base + bl + 32 + k, d2 * (float)(q >> 4)  - m2);
+        }
+    }
+    mm_store<TM>(acc, y, n_out, t0, m, o, lane);
+}
+
+template<int TM>
+__global__ void gemm_q6_K_kernel(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1); int o = blockIdx.x * WARPS + (threadIdx.x >> 5); int t0 = blockIdx.y * TM;
+    if (o >= n_out) return;
+    int nsb = n_in / 256; const uint8_t* wrow = W + (size_t)o * nsb * 210; int is = lane / 16;
+    float acc[TM]; for (int t = 0; t < TM; ++t) acc[t] = 0.f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* blk = wrow + (size_t)sb * 210;
+        const uint8_t* ql = blk; const uint8_t* qh = blk + 128; const int8_t* sc = (const int8_t*)(blk + 192);
+        float d = __half2float(*(const __half*)(blk + 208)); int sbase = sb * 256;
+        #pragma unroll
+        for (int nn = 0; nn < 256; nn += 128) {
+            const uint8_t* Ql = ql + (nn / 128) * 64; const uint8_t* Qh = qh + (nn / 128) * 32; const int8_t* Sc = sc + (nn / 128) * 8;
+            uint8_t ql0 = Ql[lane], ql1 = Ql[lane + 32], qhb = Qh[lane];
+            int q1 = (int)((ql0 & 0xF) | (((qhb >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((ql1 & 0xF) | (((qhb >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((ql0 >> 4)  | (((qhb >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((ql1 >> 4)  | (((qhb >> 6) & 3) << 4)) - 32;
+            mm_accum<TM>(acc, x, n_in, t0, m, sbase + nn + lane + 0,  d * Sc[is + 0] * q1);
+            mm_accum<TM>(acc, x, n_in, t0, m, sbase + nn + lane + 32, d * Sc[is + 2] * q2);
+            mm_accum<TM>(acc, x, n_in, t0, m, sbase + nn + lane + 64, d * Sc[is + 4] * q3);
+            mm_accum<TM>(acc, x, n_in, t0, m, sbase + nn + lane + 96, d * Sc[is + 6] * q4);
+        }
+    }
+    mm_store<TM>(acc, y, n_out, t0, m, o, lane);
+}
+
+template<int TM>
+__global__ void gemm_q5_K_kernel(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1); int o = blockIdx.x * WARPS + (threadIdx.x >> 5); int t0 = blockIdx.y * TM;
+    if (o >= n_out) return;
+    int nsb = n_in / 256; const uint8_t* wrow = W + (size_t)o * nsb * 176;
+    float acc[TM]; for (int t = 0; t < TM; ++t) acc[t] = 0.f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* blk = wrow + (size_t)sb * 176;
+        float d = __half2float(*(const __half*)blk), dmin = __half2float(*(const __half*)(blk + 2));
+        const uint8_t* scales = blk + 4; const uint8_t* qh = blk + 16; const uint8_t* ql = blk + 48;
+        uint8_t qhl = qh[lane]; int sbase = sb * 256;
+        #pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+            uint8_t sc, mn;
+            get_scale_min_k4(jj * 2 + 0, scales, &sc, &mn); float d1 = d * sc, m1 = dmin * mn;
+            get_scale_min_k4(jj * 2 + 1, scales, &sc, &mn); float d2 = d * sc, m2 = dmin * mn;
+            uint8_t q = ql[jj * 32 + lane];
+            mm_accum<TM>(acc, x, n_in, t0, m, sbase + jj * 64 + lane,      d1 * (float)((q & 0xF) + ((qhl & (1 << (2*jj))) ? 16 : 0)) - m1);
+            mm_accum<TM>(acc, x, n_in, t0, m, sbase + jj * 64 + 32 + lane, d2 * (float)((q >> 4)  + ((qhl & (2 << (2*jj))) ? 16 : 0)) - m2);
+        }
+    }
+    mm_store<TM>(acc, y, n_out, t0, m, o, lane);
+}
+
+template<int TM>
+__global__ void gemm_q3_K_kernel(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1); int o = blockIdx.x * WARPS + (threadIdx.x >> 5); int t0 = blockIdx.y * TM;
+    if (o >= n_out) return;
+    int nsb = n_in / 256; const uint8_t* wrow = W + (size_t)o * nsb * 110;
+    float acc[TM]; for (int t = 0; t < TM; ++t) acc[t] = 0.f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* blk = wrow + (size_t)sb * 110; const uint8_t* hmask = blk; const uint8_t* qs = blk + 32;
+        float d = __half2float(*(const __half*)(blk + 108)); int8_t scl[16]; unpack_q3_scales(blk + 96, scl);
+        uint8_t hml = hmask[lane]; int sbase = sb * 256;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint8_t qb = qs[h * 32 + lane];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint8_t mbit = (uint8_t)(1u << (h * 4 + j));
+                int sidx = h * 8 + j * 2 + (lane >= 16 ? 1 : 0);
+                int ql = (qb >> (2 * j)) & 3; int hb = (hml & mbit) ? 0 : 4;
+                mm_accum<TM>(acc, x, n_in, t0, m, sbase + h * 128 + j * 32 + lane, d * (float)(scl[sidx] - 32) * (float)(ql - hb));
+            }
+        }
+    }
+    mm_store<TM>(acc, y, n_out, t0, m, o, lane);
+}
+
+template<int TM>
+__global__ void gemm_q2_K_kernel(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1); int o = blockIdx.x * WARPS + (threadIdx.x >> 5); int t0 = blockIdx.y * TM;
+    if (o >= n_out) return;
+    int nsb = n_in / 256; const uint8_t* wrow = W + (size_t)o * nsb * 84;
+    float acc[TM]; for (int t = 0; t < TM; ++t) acc[t] = 0.f;
+    for (int sb = 0; sb < nsb; ++sb) {
+        const uint8_t* blk = wrow + (size_t)sb * 84; const uint8_t* scales = blk; const uint8_t* qs = blk + 16;
+        float d = __half2float(*(const __half*)(blk + 80)), dmin = __half2float(*(const __half*)(blk + 82)); int sbase = sb * 256;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint8_t qb = qs[h * 32 + lane];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = scales[h * 8 + j * 2 + (lane >= 16 ? 1 : 0)];
+                float dl = d * (float)(sc & 0xF), ml = dmin * (float)(sc >> 4);
+                mm_accum<TM>(acc, x, n_in, t0, m, sbase + h * 128 + j * 32 + lane, dl * (float)((qb >> (2 * j)) & 3) - ml);
+            }
+        }
+    }
+    mm_store<TM>(acc, y, n_out, t0, m, o, lane);
+}
+
+template<int TM>
+__global__ void gemm_q8_0_kernel(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in) {
+    int lane = threadIdx.x & (WARP - 1); int o = blockIdx.x * WARPS + (threadIdx.x >> 5); int t0 = blockIdx.y * TM;
+    if (o >= n_out) return;
+    int nb = n_in / 32; const uint8_t* wrow = W + (size_t)o * nb * 34;
+    float acc[TM]; for (int t = 0; t < TM; ++t) acc[t] = 0.f;
+    for (int b = lane; b < nb; b += WARP) {
+        const uint8_t* blk = wrow + (size_t)b * 34; float d = __half2float(*(const __half*)blk);
+        const int8_t* q = (const int8_t*)(blk + 2); int base = b * 32;
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) mm_accum<TM>(acc, x, n_in, t0, m, base + j, d * (float)q[j]);
+    }
+    mm_store<TM>(acc, y, n_out, t0, m, o, lane);
+}
 }  // namespace
 
 void fused_gemv_q8_0(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in, cudaStream_t stream) {
@@ -302,6 +460,24 @@ bool fused_gemv(const uint8_t* W, const __half* x, __half* y, int m, int n_out, 
         case 12: fused_gemv_q4_K(W, x, y, m, n_out, n_in, stream); return true;   // Q4_K
         case 13: fused_gemv_q5_K(W, x, y, m, n_out, n_in, stream); return true;   // Q5_K
         case 14: fused_gemv_q6_K(W, x, y, m, n_out, n_in, stream); return true;   // Q6_K
+        default: return false;
+    }
+}
+
+// Fused dequant-GEMM: y[m,n_out] = x[m,n_in] * dequant(W[n_out,n_in]), reading each weight
+// ONCE and accumulating over TILE_M token columns. For prefill (m>1) this reads W ceil(m/TILE_M)
+// times vs m times for repeated GEMV. Returns false if the type has no fused GEMM kernel.
+bool fused_gemm(const uint8_t* W, const __half* x, __half* y, int m, int n_out, int n_in,
+                uint32_t ggml_type, cudaStream_t stream) {
+    if (m <= 0 || n_out <= 0 || n_in <= 0) return true;
+    dim3 grid((n_out + WARPS - 1) / WARPS, (m + TILE_M - 1) / TILE_M);
+    switch (ggml_type) {
+        case 8:  gemm_q8_0_kernel<TILE_M><<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in); return true;
+        case 10: gemm_q2_K_kernel<TILE_M><<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in); return true;
+        case 11: gemm_q3_K_kernel<TILE_M><<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in); return true;
+        case 12: gemm_q4_K_kernel<TILE_M><<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in); return true;
+        case 13: gemm_q5_K_kernel<TILE_M><<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in); return true;
+        case 14: gemm_q6_K_kernel<TILE_M><<<grid, THREADS, 0, stream>>>(W, x, y, m, n_out, n_in); return true;
         default: return false;
     }
 }

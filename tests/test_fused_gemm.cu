@@ -15,7 +15,7 @@ static void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
 
 static int run(const char* name, uint32_t type, int block_bytes, int block_elems,
                void (*fill_row_ref)(const uint8_t*, int, float*)) {
-    int n_in = block_elems * 3, n_out = 17, m = 2;      // 3 blocks/row, odd n_out
+    int n_in = block_elems * 3, n_out = 17, m = 11;     // 3 blocks/row, odd n_out, m>TILE_M (crosses tiles)
     int nb = n_in / block_elems;
     std::vector<uint8_t> W((size_t)n_out * nb * block_bytes);
     for (auto& b : W) b = rand() & 0xFF;                 // random bytes (dequant formula applies to any)
@@ -45,18 +45,28 @@ static int run(const char* name, uint32_t type, int block_bytes, int block_elems
     cudaMalloc(&dW, W.size()); cudaMalloc(&dx, x.size() * 2); cudaMalloc(&dy, y_gpu.size() * 2);
     cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice);
-    if (!fused_gemv(dW, dx, dy, m, n_out, n_in, type, 0)) { printf("FAIL %s: no kernel\n", name); return 1; }
+    auto max_rel_err = [&]() {
+        float mr = 0;
+        for (size_t i = 0; i < y_ref.size(); ++i)
+            mr = fmaxf(mr, fabsf(__half2float(y_gpu[i]) - y_ref[i]) / (fabsf(y_ref[i]) + 1e-2f));
+        return mr;
+    };
+    // GEMV path (decode)
+    if (!fused_gemv(dW, dx, dy, m, n_out, n_in, type, 0)) { printf("FAIL %s: no gemv kernel\n", name); return 1; }
     cudaDeviceSynchronize();
     cudaMemcpy(y_gpu.data(), dy, y_gpu.size() * 2, cudaMemcpyDeviceToHost);
+    float rv = max_rel_err();
+    // GEMM path (prefill) — same result, W read once per tile
+    cudaMemset(dy, 0, y_gpu.size() * 2);
+    if (!fused_gemm(dW, dx, dy, m, n_out, n_in, type, 0)) { printf("FAIL %s: no gemm kernel\n", name); cudaFree(dW); cudaFree(dx); cudaFree(dy); return 1; }
+    cudaDeviceSynchronize();
+    cudaMemcpy(y_gpu.data(), dy, y_gpu.size() * 2, cudaMemcpyDeviceToHost);
+    float rg = max_rel_err();
     cudaFree(dW); cudaFree(dx); cudaFree(dy);
 
     // fp16 output has ~2^-11 relative precision, so compare RELATIVE error.
-    float max_rel = 0;
-    for (size_t i = 0; i < y_ref.size(); ++i) {
-        float e = fabsf(__half2float(y_gpu[i]) - y_ref[i]) / (fabsf(y_ref[i]) + 1e-2f);
-        max_rel = fmaxf(max_rel, e);
-    }
-    printf("%s: max rel err = %.4f  %s\n", name, max_rel, max_rel < 0.02f ? "PASS" : "FAIL");
+    float max_rel = fmaxf(rv, rg);
+    printf("%s: gemv rel %.4f | gemm rel %.4f  %s\n", name, rv, rg, max_rel < 0.02f ? "PASS" : "FAIL");
     return max_rel < 0.02f ? 0 : 1;
 }
 
