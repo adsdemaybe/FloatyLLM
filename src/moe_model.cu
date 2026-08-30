@@ -332,6 +332,13 @@ static bool dense_decode_supported(LoadedMoeModel& m) {
 // and short prefills (fused GEMV re-reads W per token, so only worthwhile for small n_new;
 // long prompts keep the dequant-once + cuBLAS-GEMM path). Returns false on a structural
 // mismatch.
+// One token -> fused GEMV; many tokens (prefill) -> fused GEMM (reads W once, all tokens).
+static inline void fused_mm(const uint8_t* W, const __half* x, __half* y, int n_new,
+                            int n_out, int n_in, uint32_t type, cudaStream_t st) {
+    if (n_new == 1) fused_gemv(W, x, y, 1, n_out, n_in, type, st);
+    else            fused_gemm(W, x, y, n_new, n_out, n_in, type, st);
+}
+
 static bool dense_decode_layer(MoeSession& S, int L, int len_before, int n_new, cudaStream_t st) {
     LoadedMoeModel& m = *S.m; const LlamaConfig& cfg = m.cfg;
     int dim = cfg.dim, qd = cfg.n_heads*cfg.head_dim, kvd = cfg.n_kv_heads*cfg.head_dim, ef = m.mcfg.expert_ffn;
@@ -368,22 +375,22 @@ static bool dense_decode_layer(MoeSession& S, int L, int len_before, int n_new, 
     __half* Vdst = Vbase + (size_t)len_before * kvd;
 
     rmsnorm(S.hidden, an_w, S.s.xn, n_new, dim, cfg.eps, st);
-    fused_gemv(wq.src, S.s.xn, S.s.q, n_new, qd, dim, wq.mr->type, st);
-    fused_gemv(wk.src, S.s.xn, Kdst, n_new, kvd, dim, wk.mr->type, st);
-    fused_gemv(wv.src, S.s.xn, Vdst, n_new, kvd, dim, wv.mr->type, st);
+    fused_mm(wq.src, S.s.xn, S.s.q, n_new, qd, dim, wq.mr->type, st);
+    fused_mm(wk.src, S.s.xn, Kdst, n_new, kvd, dim, wk.mr->type, st);
+    fused_mm(wv.src, S.s.xn, Vdst, n_new, kvd, dim, wv.mr->type, st);
     rope_inplace(S.s.q, S.positions, n_new, cfg.n_heads, cfg.head_dim, cfg.rope_base, st);
     rope_inplace(Kdst, S.positions, n_new, cfg.n_kv_heads, cfg.head_dim, cfg.rope_base, st);
     attention_cached(S.s.q, Kbase, Vbase, S.s.att, n_new, len_before,
                      cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, st);
-    fused_gemv(wo.src, S.s.att, S.s.proj, n_new, dim, qd, wo.mr->type, st);
+    fused_mm(wo.src, S.s.att, S.s.proj, n_new, dim, qd, wo.mr->type, st);
     residual_add(S.hidden, S.s.proj, n_new * dim, st);
 
     rmsnorm(S.hidden, fn_w, S.s.xn, n_new, dim, cfg.eps, st);
-    fused_gemv(wg.src, S.s.xn, S.ms.gate, n_new, ef, dim, wg.mr->type, st);
-    fused_gemv(wu.src, S.s.xn, S.ms.up, n_new, ef, dim, wu.mr->type, st);
+    fused_mm(wg.src, S.s.xn, S.ms.gate, n_new, ef, dim, wg.mr->type, st);
+    fused_mm(wu.src, S.s.xn, S.ms.up, n_new, ef, dim, wu.mr->type, st);
     silu(S.ms.gate, S.ms.gate, n_new * ef, st);
     elementwise_mul(S.ms.gate, S.ms.up, S.ms.gate, n_new * ef, st);
-    fused_gemv(wd.src, S.ms.gate, S.ms.ye, n_new, dim, ef, wd.mr->type, st);
+    fused_mm(wd.src, S.ms.gate, S.ms.ye, n_new, dim, ef, wd.mr->type, st);
     residual_add(S.hidden, S.ms.ye, n_new * dim, st);
     return true;
 }
@@ -398,13 +405,13 @@ bool moe_session_eval(MoeSession& S, const int* ids, int n_new, std::string* err
     cudaMemcpy(S.positions, pos.data(), n_new*4, cudaMemcpyHostToDevice);
     embed_tokens(m.rw.token_embd, S.d_ids, S.hidden, n_new, dim, S.cm);
     ExpertCache& c = S.cache;
-    // Dense fused path: one-expert model, all weights fused-GEMV capable -> compute each
-    // layer straight from mmap quant (no dequant arena/transpose/cache). Used for decode
-    // and prefills up to a crossover: the fused GEMV re-reads W per token (~cost n_new x
-    // one decode), while the old dequant+transpose+cuBLAS pass is a fixed ~1 model pass.
-    // Measured crossover on 70B q4km is ~170 tokens; use 160 so typical prompts get the
-    // fused path (avoids the ~55s naive-transpose prefill), long prompts keep GEMM.
-    bool dense_fused = (E == 1 && n_new <= 160 && dense_decode_supported(m));
+    // Dense fused path: one-expert model, all weights fused-GEMV/GEMM capable -> compute each
+    // layer straight from mmap quant (no dequant arena/transpose/cache). Decode (n_new=1) uses
+    // fused GEMV; prefill (n_new>1) uses fused GEMM (reads W once per TILE_M=8 tokens, ~m/8
+    // model reads vs m for repeated GEMV). Old dequant+transpose+cuBLAS pass is a fixed ~55s;
+    // fused GEMM beats it up to ~1400 tokens, so gate at 1024 (covers typical prompts; longer
+    // prompts fall back to the amortized cuBLAS path).
+    bool dense_fused = (E == 1 && n_new <= 1024 && dense_decode_supported(m));
     int active[256]; bool miss[256]; int slot_of[256];
     for (int L=0; L<m.n_layers; ++L) {
         if (dense_fused) { dense_decode_layer(S, L, len_before, n_new, S.cm); continue; }
