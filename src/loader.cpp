@@ -3,12 +3,41 @@
 #include "loader.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 namespace {
+
+// Fault the whole mmap'd file into the page cache in PARALLEL. On first (cold) run the model
+// is otherwise paged in single-threaded, on demand, during the first prefill/decode (slow disk
+// crawl). Touching one byte per page across N threads uses the full disk bandwidth, so the
+// cost moves to load time and shrinks ~Nx. On a warm run (pages already cached) this is a
+// cheap read sweep. Disable with SEMILLM_NO_WARM=1.
+void warm_pages(const uint8_t* p, size_t sz) {
+    if (const char* e = getenv("SEMILLM_NO_WARM")) { if (atoi(e)) return; }
+    unsigned hw = std::thread::hardware_concurrency();
+    int nthreads = (int)(hw ? (hw < 16 ? hw : 16) : 8);
+    size_t page = 4096, chunk = (sz + nthreads - 1) / nthreads;
+    std::atomic<uint64_t> sink{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < nthreads; ++t) {
+        size_t s = (size_t)t * chunk, e = s + chunk > sz ? sz : s + chunk;
+        if (s >= sz) break;
+        ts.emplace_back([p, s, e, page, &sink] {
+            uint64_t acc = 0;
+            for (size_t i = s; i < e; i += page) acc += p[i];   // touch each page -> fault in
+            sink += acc;
+        });
+    }
+    for (auto& th : ts) th.join();
+    (void)sink;
+}
 
 struct Cursor {
     const uint8_t* p;
@@ -95,7 +124,10 @@ static bool parse_shard(const char* path, GgufFile* out, int shard_idx, bool fir
     size_t sz = (size_t)st.st_size;
     void* p = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) { close(fd); return fail("mmap failed"); }
-    madvise(p, sz, MADV_SEQUENTIAL);
+    // WILLNEED (not SEQUENTIAL): the whole model is re-read every token, so keep pages
+    // resident and let the kernel prefetch; then warm the page cache in parallel.
+    madvise(p, sz, MADV_WILLNEED);
+    warm_pages((const uint8_t*)p, sz);
     Shard sh; sh.data = (const uint8_t*)p; sh.size = sz; sh.fd = fd;
 
     Cursor c{sh.data, 0, sh.size};
