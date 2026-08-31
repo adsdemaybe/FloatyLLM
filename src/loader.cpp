@@ -11,16 +11,41 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace {
+
+size_t total_ram() {
+#if defined(__APPLE__)
+    int mib[2] = {CTL_HW, HW_MEMSIZE}; uint64_t v = 0; size_t l = sizeof(v);
+    if (sysctl(mib, 2, &v, &l, nullptr, 0) == 0) return (size_t)v;
+    return 0;
+#else
+    long p = sysconf(_SC_PHYS_PAGES), s = sysconf(_SC_PAGE_SIZE);
+    return (p > 0 && s > 0) ? (size_t)p * s : 0;
+#endif
+}
 
 // Fault the whole mmap'd file into the page cache in PARALLEL. On first (cold) run the model
 // is otherwise paged in single-threaded, on demand, during the first prefill/decode (slow disk
 // crawl). Touching one byte per page across N threads uses the full disk bandwidth, so the
 // cost moves to load time and shrinks ~Nx. On a warm run (pages already cached) this is a
 // cheap read sweep. Disable with SEMILLM_NO_WARM=1.
+//
+// AUTO-SKIP when the model can't fit in RAM (sz > ~70% of total): warming would thrash
+// (fault in -> evict -> re-fault). There the runner streams layers from disk on demand
+// (small footprint, AirLLM-style), so we must NOT try to resident-load everything.
 void warm_pages(const uint8_t* p, size_t sz) {
     if (const char* e = getenv("SEMILLM_NO_WARM")) { if (atoi(e)) return; }
+    size_t ram = total_ram();
+    if (ram && sz > ram * 7 / 10) {
+        fprintf(stderr, "[floaty] model %.1f GB > RAM budget (%.1f GB) -> stream from disk (no warm)\n",
+                sz / 1e9, ram * 7.0 / 10.0 / 1e9);
+        madvise((void*)p, sz, MADV_RANDOM);   // don't over-cache; keep footprint small
+        return;
+    }
     unsigned hw = std::thread::hardware_concurrency();
     int nthreads = (int)(hw ? (hw < 16 ? hw : 16) : 8);
     size_t page = 4096, chunk = (sz + nthreads - 1) / nthreads;

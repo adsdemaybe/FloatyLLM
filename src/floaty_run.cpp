@@ -13,9 +13,37 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <sys/mman.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+static size_t total_ram() {
+#if defined(__APPLE__)
+    int mib[2] = {CTL_HW, HW_MEMSIZE}; uint64_t v = 0; size_t l = sizeof(v);
+    return sysctl(mib, 2, &v, &l, nullptr, 0) == 0 ? (size_t)v : 0;
+#else
+    long p = sysconf(_SC_PHYS_PAGES), s = sysconf(_SC_PAGE_SIZE);
+    return (p > 0 && s > 0) ? (size_t)p * s : 0;
+#endif
+}
+// Page-aligned madvise over one weight matrix's mmap bytes (prefetch / evict).
+static void madv_mat(const FMat& mr, int advice) {
+    if (!mr.src) return;
+    size_t pg = (size_t)getpagesize();
+    uintptr_t a = (uintptr_t)mr.src, end = a + mr.quant_bytes;
+    uintptr_t sa = a & ~(pg - 1), ea = (end + pg - 1) & ~(pg - 1);
+    madvise((void*)sa, ea - sa, advice);
+}
+static void madv_layer(const FLayer& ly, int advice) {
+    madv_mat(ly.wq, advice); madv_mat(ly.wk, advice); madv_mat(ly.wv, advice); madv_mat(ly.wo, advice);
+    madv_mat(ly.gate, advice); madv_mat(ly.up, advice); madv_mat(ly.down, advice);
+}
 
 struct Session {
     FModel* m; Backend* b; int max_T, len = 0;
+    bool stream = false; int resident_K = 0;   // low-RAM: stream layers >= K from disk
     int dim, qd, kvd, ffn, n_heads, n_kv_heads, head_dim, vocab;
     void *hidden, *xn, *q, *att, *proj, *gate, *up, *ye, *logits, *positions, *ids;
     void *K, *V, *embd, *fnorm;
@@ -58,6 +86,9 @@ static void forward(Session& S, const int* toks, int n_new) {
     b.embed(S.embd, S.ids, S.hidden, n_new, dim);
     for (int L = 0; L < m.n_layers; ++L) {
         FLayer& ly = m.layers[L];
+        // low-RAM stream: prefetch the next non-resident layer from disk (overlaps its read
+        // with this layer's GPU compute), AirLLM-style but on quantized bytes.
+        if (S.stream && L + 1 < m.n_layers && L + 1 >= S.resident_K) madv_layer(m.layers[L+1], MADV_WILLNEED);
         size_t kbase = (size_t)L*S.max_T*kvd, kdst = kbase + (size_t)len*kvd;
         b.rmsnorm(S.hidden, S.an[L], S.xn, n_new, dim, m.eps);
         b.fused_gemv(S.wq[L], S.xn, S.q, n_new, qd, dim, ly.wq.type);
@@ -74,6 +105,9 @@ static void forward(Session& S, const int* toks, int n_new) {
         b.silu_mul(S.gate, S.up, n_new*ffn);
         b.fused_gemv(S.wd[L], S.gate, S.ye, n_new, dim, ffn, ly.down.type);
         b.residual_add(S.hidden, S.ye, n_new*dim);
+        // Stream mode: finish this layer's GPU reads, then evict its pages so the resident
+        // footprint stays at ~resident_K + 1 layers (never the whole model).
+        if (S.stream && L >= S.resident_K) { b.sync(); madv_layer(ly, MADV_DONTNEED); }
     }
     b.rmsnorm(S.hidden, S.fnorm, S.xn, n_new, dim, m.eps);
     b.fused_gemv(S.head, S.xn, S.logits, 1, S.vocab, dim, m.output.type, 0, (size_t)(n_new-1)*dim);
@@ -111,6 +145,24 @@ int main(int argc, char** argv) {
     if (ids.empty()) { uint32_t bos; ids.push_back(gguf_get_u32(m.g, "tokenizer.ggml.bos_token_id", &bos) ? (int)bos : 1); }
 
     Session S; init(S, m, *b, ids.size() + n_gen + 8);
+    // Decide resident vs stream from the model size and a RAM budget (auto = 70% of RAM;
+    // override with FLOATY_RAM_GB). Stream mode keeps the first K layers resident and pages
+    // the rest from disk per token -> small footprint, runs in low RAM (AirLLM regime) but
+    // on quantized bytes + with K layers cached -> faster than AirLLM.
+    size_t model_bytes = 0;
+    for (auto& ly : m.layers) model_bytes += ly.wq.quant_bytes + ly.wk.quant_bytes + ly.wv.quant_bytes
+        + ly.wo.quant_bytes + ly.gate.quant_bytes + ly.up.quant_bytes + ly.down.quant_bytes;
+    size_t ram = total_ram(); size_t budget = ram ? ram * 7 / 10 : (size_t)-1;
+    if (const char* e = getenv("FLOATY_RAM_GB")) budget = (size_t)(atof(e) * 1e9);
+    size_t lb = model_bytes / (m.n_layers > 0 ? m.n_layers : 1);
+    if (model_bytes > budget) {
+        S.stream = true; S.resident_K = (int)(budget / (lb ? lb : 1));
+        if (S.resident_K < 0) S.resident_K = 0; if (S.resident_K > m.n_layers) S.resident_K = m.n_layers;
+        printf("stream mode: model %.2f GB > budget %.2f GB -> %d/%d layers resident, rest streamed from disk\n",
+               model_bytes / 1e9, budget / 1e9, S.resident_K, m.n_layers);
+    } else {
+        printf("resident: model %.2f GB fits budget %.2f GB\n", model_bytes / 1e9, budget / 1e9);
+    }
     auto it = m.g.meta.find("tokenizer.ggml.tokens");
     const MetaValue* vtoks = it != m.g.meta.end() ? &it->second : nullptr;
 
