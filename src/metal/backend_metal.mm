@@ -106,13 +106,14 @@ public:
         [enc setBytes:p length:n atIndex:idx];
     }
 
-    void fused_gemv(const void* W, const void* x, void* y, int m, int n_out, int n_in, uint32_t type) override {
+    void fused_gemv(const void* W, const void* x, void* y, int m, int n_out, int n_in, uint32_t type,
+                    size_t y_off = 0, size_t x_off = 0) override {
         const char* kn = gemv_name(type); if (!kn) return;
         id<MTLComputeCommandEncoder> enc = begin();
         [enc setComputePipelineState:pipe(kn)];
         [enc setBuffer:(__bridge id<MTLBuffer>)W offset:0 atIndex:0];
-        [enc setBuffer:(__bridge id<MTLBuffer>)x offset:0 atIndex:1];
-        [enc setBuffer:(__bridge id<MTLBuffer>)y offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)x offset:x_off * 2 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)y offset:y_off * 2 atIndex:2];
         GemvDims d{m, n_out, n_in}; setDims(enc, 3, &d, sizeof(d));
         [enc dispatchThreadgroups:MTLSizeMake((n_out + 7) / 8, m, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -128,23 +129,24 @@ public:
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [enc endEncoding];
     }
-    void rope(void* x, const void* pos, int n_tokens, int n_heads, int head_dim, float base) override {
+    void rope(void* x, const void* pos, int n_tokens, int n_heads, int head_dim, float base,
+              size_t x_off = 0) override {
         id<MTLComputeCommandEncoder> enc = begin();
         [enc setComputePipelineState:pipe("rope")];
-        [enc setBuffer:(__bridge id<MTLBuffer>)x offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)x offset:x_off * 2 atIndex:0];
         [enc setBuffer:(__bridge id<MTLBuffer>)pos offset:0 atIndex:1];
         RopeArgs a{n_tokens, n_heads, head_dim, base}; setDims(enc, 2, &a, sizeof(a));
         int total = n_tokens * n_heads * (head_dim / 2);
         [enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     }
-    void attention(const void* Q, const void* Kc, const void* Vc, void* out, int n_new, int len_before,
-                   int n_heads, int n_kv_heads, int head_dim, float scale) override {
+    void attention(const void* Q, const void* Kc, size_t k_off, const void* Vc, size_t v_off, void* out,
+                   int n_new, int len_before, int n_heads, int n_kv_heads, int head_dim, float scale) override {
         id<MTLComputeCommandEncoder> enc = begin();
         [enc setComputePipelineState:pipe("attention")];
         [enc setBuffer:(__bridge id<MTLBuffer>)Q offset:0 atIndex:0];
-        [enc setBuffer:(__bridge id<MTLBuffer>)Kc offset:0 atIndex:1];
-        [enc setBuffer:(__bridge id<MTLBuffer>)Vc offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)Kc offset:k_off * 2 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)Vc offset:v_off * 2 atIndex:2];
         [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:3];
         AttnArgs a{n_new, len_before, n_heads, n_kv_heads, head_dim, scale}; setDims(enc, 4, &a, sizeof(a));
         [enc dispatchThreadgroups:MTLSizeMake(n_new, n_heads, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];

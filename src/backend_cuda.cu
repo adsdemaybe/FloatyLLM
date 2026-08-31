@@ -44,18 +44,20 @@ public:
     void* wrap_host(const void* host, size_t) override { return const_cast<void*>(host); }
     void  sync() override { cudaStreamSynchronize(st); }
 
-    void fused_gemv(const void* W, const void* x, void* y, int m, int n_out, int n_in, uint32_t type) override {
-        ::fused_gemv((const uint8_t*)W, (const __half*)x, (__half*)y, m, n_out, n_in, type, st);
+    void fused_gemv(const void* W, const void* x, void* y, int m, int n_out, int n_in, uint32_t type,
+                    size_t y_off = 0, size_t x_off = 0) override {
+        ::fused_gemv((const uint8_t*)W, (const __half*)x + x_off, (__half*)y + y_off, m, n_out, n_in, type, st);
     }
     void rmsnorm(const void* x, const void* w, void* out, int n_rows, int dim, float eps) override {
         ::rmsnorm((const __half*)x, (const __half*)w, (__half*)out, n_rows, dim, eps, st);
     }
-    void rope(void* x, const void* pos, int n_tokens, int n_heads, int head_dim, float base) override {
-        ::rope_inplace((__half*)x, (const int*)pos, n_tokens, n_heads, head_dim, base, st);
+    void rope(void* x, const void* pos, int n_tokens, int n_heads, int head_dim, float base,
+              size_t x_off = 0) override {
+        ::rope_inplace((__half*)x + x_off, (const int*)pos, n_tokens, n_heads, head_dim, base, st);
     }
-    void attention(const void* Q, const void* Kc, const void* Vc, void* out, int n_new, int len_before,
-                   int n_heads, int n_kv_heads, int head_dim, float scale) override {
-        ::attention_cached((const __half*)Q, (const __half*)Kc, (const __half*)Vc, (__half*)out,
+    void attention(const void* Q, const void* Kc, size_t k_off, const void* Vc, size_t v_off, void* out,
+                   int n_new, int len_before, int n_heads, int n_kv_heads, int head_dim, float scale) override {
+        ::attention_cached((const __half*)Q, (const __half*)Kc + k_off, (const __half*)Vc + v_off, (__half*)out,
                            n_new, len_before, n_heads, n_kv_heads, head_dim, scale, st);
     }
     void silu_mul(void* gate, const void* up, int n) override {

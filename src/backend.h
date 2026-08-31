@@ -27,12 +27,16 @@ struct Backend {
 
     // --- kernels ---
     // y[m,n_out] = x[m,n_in] * dequant(W[n_out,n_in]) reading W in native GGUF quant layout.
+    // y_off_elems shifts the output write (fp16 elems) -- e.g. to write K/V into a KV cache
+    // at a token/layer offset.
     virtual void fused_gemv(const void* W, const void* x, void* y, int m, int n_out, int n_in,
-                            uint32_t ggml_type) = 0;
+                            uint32_t ggml_type, size_t y_off_elems = 0, size_t x_off_elems = 0) = 0;
     virtual void rmsnorm(const void* x, const void* w, void* out, int n_rows, int dim, float eps) = 0;
-    virtual void rope(void* x, const void* positions, int n_tokens, int n_heads, int head_dim, float base) = 0;
-    virtual void attention(const void* Q, const void* Kcache, const void* Vcache, void* out,
-                           int n_new, int len_before, int n_heads, int n_kv_heads, int head_dim, float scale) = 0;
+    virtual void rope(void* x, const void* positions, int n_tokens, int n_heads, int head_dim, float base,
+                      size_t x_off_elems = 0) = 0;
+    // Kcache/Vcache read from their layer base via k_off/v_off (fp16 elems).
+    virtual void attention(const void* Q, const void* Kcache, size_t k_off, const void* Vcache, size_t v_off,
+                           void* out, int n_new, int len_before, int n_heads, int n_kv_heads, int head_dim, float scale) = 0;
     virtual void silu_mul(void* gate, const void* up, int n) = 0;
     virtual void residual_add(void* x, const void* y, int n) = 0;
     virtual void embed(const void* table, const void* ids, void* out, int n, int dim) = 0;
