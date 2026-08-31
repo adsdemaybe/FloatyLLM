@@ -43,7 +43,7 @@ static void madv_layer(const FLayer& ly, int advice) {
 
 struct Session {
     FModel* m; Backend* b; int max_T, len = 0;
-    bool stream = false; int resident_K = 0;   // low-RAM: stream layers >= K from disk
+    bool stream = false; int resident_K = 0, chunk = 4;   // low-RAM: stream layers >= K from disk
     int dim, qd, kvd, ffn, n_heads, n_kv_heads, head_dim, vocab;
     void *hidden, *xn, *q, *att, *proj, *gate, *up, *ye, *logits, *positions, *ids;
     void *K, *V, *embd, *fnorm;
@@ -84,11 +84,18 @@ static void forward(Session& S, const int* toks, int n_new) {
     std::vector<int> pos(n_new); for (int i = 0; i < n_new; ++i) pos[i] = len + i;
     b.upload(S.ids, toks, n_new*4); b.upload(S.positions, pos.data(), n_new*4);
     b.embed(S.embd, S.ids, S.hidden, n_new, dim);
+    // Prime the pipeline: start disk reads for the first chunk of streamed layers so the OS
+    // is fetching them before we need them.
+    if (S.stream) for (int p = S.resident_K; p < S.resident_K + S.chunk && p < m.n_layers; ++p) madv_layer(m.layers[p], MADV_WILLNEED);
     for (int L = 0; L < m.n_layers; ++L) {
         FLayer& ly = m.layers[L];
-        // low-RAM stream: prefetch the next non-resident layer from disk (overlaps its read
-        // with this layer's GPU compute), AirLLM-style but on quantized bytes.
-        if (S.stream && L + 1 < m.n_layers && L + 1 >= S.resident_K) madv_layer(m.layers[L+1], MADV_WILLNEED);
+        // Pipelined prefetch: keep the disk `chunk` layers AHEAD of compute, so each layer's
+        // read overlaps the GPU work of the layers before it (no per-layer stall). AirLLM-style
+        // streaming but on quantized bytes and deeply overlapped.
+        if (S.stream && L >= S.resident_K) {
+            int pf = L + S.chunk;
+            if (pf < m.n_layers && pf >= S.resident_K) madv_layer(m.layers[pf], MADV_WILLNEED);
+        }
         size_t kbase = (size_t)L*S.max_T*kvd, kdst = kbase + (size_t)len*kvd;
         b.rmsnorm(S.hidden, S.an[L], S.xn, n_new, dim, m.eps);
         b.fused_gemv(S.wq[L], S.xn, S.q, n_new, qd, dim, ly.wq.type);
@@ -105,9 +112,16 @@ static void forward(Session& S, const int* toks, int n_new) {
         b.silu_mul(S.gate, S.up, n_new*ffn);
         b.fused_gemv(S.wd[L], S.gate, S.ye, n_new, dim, ffn, ly.down.type);
         b.residual_add(S.hidden, S.ye, n_new*dim);
-        // Stream mode: finish this layer's GPU reads, then evict its pages so the resident
-        // footprint stays at ~resident_K + 1 layers (never the whole model).
-        if (S.stream && L >= S.resident_K) { b.sync(); madv_layer(ly, MADV_DONTNEED); }
+        // At each chunk boundary: sync (the streamed layers in this chunk are done being read
+        // by the GPU), then evict the chunk's pages. Footprint stays ~ resident_K + 2*chunk
+        // (in-flight + prefetched), while the NEXT chunk's disk reads already overlapped this
+        // chunk's compute. Bigger chunk = more overlap, larger footprint (FLOATY_STREAM_CHUNK).
+        if (S.stream && L >= S.resident_K &&
+            ((L - S.resident_K + 1) % S.chunk == 0 || L == m.n_layers - 1)) {
+            b.sync();
+            int lo = S.resident_K + ((L - S.resident_K) / S.chunk) * S.chunk;
+            for (int e = lo; e <= L; ++e) madv_layer(m.layers[e], MADV_DONTNEED);
+        }
     }
     b.rmsnorm(S.hidden, S.fnorm, S.xn, n_new, dim, m.eps);
     b.fused_gemv(S.head, S.xn, S.logits, 1, S.vocab, dim, m.output.type, 0, (size_t)(n_new-1)*dim);
@@ -155,11 +169,13 @@ int main(int argc, char** argv) {
     size_t ram = total_ram(); size_t budget = ram ? ram * 7 / 10 : (size_t)-1;
     if (const char* e = getenv("FLOATY_RAM_GB")) budget = (size_t)(atof(e) * 1e9);
     size_t lb = model_bytes / (m.n_layers > 0 ? m.n_layers : 1);
+    if (const char* e = getenv("FLOATY_STREAM_CHUNK")) { int c = atoi(e); if (c >= 1) S.chunk = c; }
     if (model_bytes > budget) {
         S.stream = true; S.resident_K = (int)(budget / (lb ? lb : 1));
         if (S.resident_K < 0) S.resident_K = 0; if (S.resident_K > m.n_layers) S.resident_K = m.n_layers;
-        printf("stream mode: model %.2f GB > budget %.2f GB -> %d/%d layers resident, rest streamed from disk\n",
-               model_bytes / 1e9, budget / 1e9, S.resident_K, m.n_layers);
+        for (int L = 0; L < S.resident_K; ++L) madv_layer(m.layers[L], MADV_WILLNEED);   // pin resident set
+        printf("stream mode: model %.2f GB > budget %.2f GB -> %d/%d layers resident, rest streamed (chunk %d, prefetch-overlapped)\n",
+               model_bytes / 1e9, budget / 1e9, S.resident_K, m.n_layers, S.chunk);
     } else {
         printf("resident: model %.2f GB fits budget %.2f GB\n", model_bytes / 1e9, budget / 1e9);
     }
